@@ -347,7 +347,8 @@ def load_fp8_weight(z, key, dev, w8a16=False):
 FP8_E4M3_MAX = 448.0
 
 def linear_nvfp4(x, weight_info, out_dtype=torch.float16):
-    """NVFP4 GEMM (W4A4): quantize input on-the-fly using FUSED Triton kernel, then _scaled_mm.
+    """NVFP4 GEMM (W4A4): quantize input on-the-fly, then FP4×FP4 _scaled_mm.
+    No dequantization — true quantized GEMM.
 
     Args:
         x: [B, T, K] or [M, K] fp16/bf16 input
@@ -366,10 +367,15 @@ def linear_nvfp4(x, weight_info, out_dtype=torch.float16):
     if x_2d.dtype == torch.float16:
         x_2d = x_2d.to(torch.bfloat16)
 
+    # Apply AWQ inverse scaling BEFORE quantization: x' = x / s
+    awq_scale = weight_info.get("awq_scale", None)
+    if awq_scale is not None:
+        x_2d = x_2d / awq_scale.to(x_2d.dtype)
+
     # Fused quantization: quantize + pack + swizzle in one kernel
     x_packed, x_bs_swizzled, x_ts = fused_nvfp4_quant(x_2d)
 
-    # FP4×FP4→BF16 GEMM
+    # FP4×FP4→BF16 GEMM (no dequantization)
     a_fp4 = x_packed.view(torch.float4_e2m1fn_x2)
     b_fp4 = w.view(torch.float4_e2m1fn_x2)
 
@@ -379,6 +385,23 @@ def linear_nvfp4(x, weight_info, out_dtype=torch.float16):
 
     # Fold per-tensor scales
     out = out * x_ts * w_ts
+
+    # Add FP8 residual if present (NVFP4+FP8 residual scheme)
+    # Residual is in AWQ-scaled space, same x_2d already has AWQ applied
+    if "res_fp8" in weight_info:
+        res_w = weight_info["res_fp8"]           # [N, K] float8_e4m3fn
+        res_scale = weight_info["res_fp8_scale"] # scalar fp32
+        # FP8×FP8→BF16 GEMM for residual (W8A8, no dequantization)
+        amax_x = x_2d.abs().max()
+        if amax_x > 0:
+            x_scale = (amax_x / FP8_E4M3_MAX).float()
+        else:
+            x_scale = torch.tensor(1.0, dtype=torch.float32, device=x_2d.device)
+        x_fp8 = (x_2d.float() / x_scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+        res_out = torch._scaled_mm(x_fp8, res_w.t(),
+            scale_a=x_scale.reshape(1), scale_b=res_scale.reshape(1),
+            out_dtype=torch.bfloat16)
+        out = out + res_out
 
     N = w.size(0)
     out = out.reshape(*orig_shape[:-1], N)
@@ -520,4 +543,5 @@ def linear_quantized(x, weight_info, out_dtype=torch.float16):
         return linear_fp8_w8a16(x, weight_info, out_dtype)
     if qtype in ("nvfp4_w4a16", "nvfp4_res_w4a16"):
         return linear_nvfp4_w4a16(x, weight_info, out_dtype)
+    # nvfp4 and nvfp4_res both use W4A4 quantized GEMM (no dequantization)
     return linear_nvfp4(x, weight_info, out_dtype)
