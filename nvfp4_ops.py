@@ -4,9 +4,10 @@
 Provides:
 - is_nvfp4_weight: detect NVFP4 quantized weights (has .nf4_b_scale sibling)
 - is_fp8_weight: detect FP8 quantized weights (has .fp8_scale sibling)
-- load_nvfp4_weight: load + swizzle block scale during model init
+- load_nvfp4_weight: load + optionally swizzle block scale during model init
 - load_fp8_weight: load FP8 weight + per-tensor scale
-- linear_nvfp4: NVFP4 GEMM (FP4×FP4→BF16) with FUSED activation quantization
+- linear_nvfp4: NVFP4 GEMM (FP4×FP4→BF16) with FUSED activation quantization (W4A4)
+- linear_nvfp4_w4a16: NVFP4 W4A16 GEMM (dequant weight→BF16, FP16 activation)
 - linear_fp8: FP8 GEMM (FP8×FP8→BF16) with online activation quantization
 - linear_quantized: dispatcher that picks the right GEMM based on weight_info
 """
@@ -190,6 +191,66 @@ def fused_nvfp4_quant(x, per_tensor_scale=None):
 
 
 # ============================================================================
+# NVFP4 Dequantization (W4A16 path)
+# ============================================================================
+
+# FP4 E2M1 lookup table: index → float value
+# Encoding: bit 3 = sign, bits 0-2 = magnitude code
+# 0:+0.0  1:+0.5  2:+1.0  3:+1.5  4:+2.0  5:+3.0  6:+4.0  7:+6.0
+# 8:-0.0  9:-0.5 10:-1.0 11:-1.5 12:-2.0 13:-3.0 14:-4.0 15:-6.0
+_FP4_TABLE = None
+
+def _get_fp4_table(device):
+    global _FP4_TABLE
+    if _FP4_TABLE is None or _FP4_TABLE.device != device:
+        _FP4_TABLE = torch.tensor([
+            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+            -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0
+        ], dtype=torch.float32, device=device)
+    return _FP4_TABLE
+
+
+def dequantize_nvfp4(packed, block_scale, tensor_scale):
+    """Dequantize NVFP4 packed weight to BF16 (pure PyTorch, W4A16 path).
+
+    Args:
+        packed: [N, K//2] uint8 (packed FP4 pairs, hi*16+lo convention)
+        block_scale: [N, K//16] float8_e4m3fn (NOT swizzled, normal layout)
+        tensor_scale: scalar float32 (per-tensor) or [N] float32 (per-channel)
+
+    Returns:
+        [N, K] bfloat16 tensor
+    """
+    N, K_half = packed.shape
+    K = K_half * 2
+
+    # Unpack: [N, K//2] uint8 → [N, K] uint8 (FP4 nibble indices)
+    lo = (packed & 0x0F)                                   # [N, K//2] - even indices
+    hi = ((packed >> 4) & 0x0F)                            # [N, K//2] - odd indices
+    fp4_idx = torch.empty(N, K, dtype=torch.uint8, device=packed.device)
+    fp4_idx[:, 0::2] = lo
+    fp4_idx[:, 1::2] = hi
+
+    # Lookup FP4 float values
+    table = _get_fp4_table(packed.device)
+    values = table[fp4_idx.long()]                         # [N, K] float32
+
+    # Apply block scales via reshape + broadcast (auto-detect block_size)
+    n_blocks = block_scale.shape[1]                        # K // block_size
+    block_size = K // n_blocks
+    values = values.view(N, n_blocks, block_size)          # [N, n_blocks, block_size]
+    bs = block_scale.to(torch.float32).unsqueeze(-1)       # [N, n_blocks, 1]
+    out = (values * bs).view(N, K)                         # [N, K] float32
+
+    # Apply tensor scale (scalar for per-tensor, [N] for per-channel)
+    if tensor_scale.dim() == 0:
+        out = out * tensor_scale                           # scalar
+    else:
+        out = out * tensor_scale.unsqueeze(-1)             # [N, 1] broadcast
+    return out.to(torch.bfloat16)
+
+
+# ============================================================================
 # Detection
 # ============================================================================
 
@@ -206,31 +267,68 @@ def is_fp8_weight(z, key):
 # Loading
 # ============================================================================
 
-def load_nvfp4_weight(z, key, dev):
-    """Load NVFP4 weight: packed uint8 + pre-swizzled block scale + tensor scale.
+def load_nvfp4_weight(z, key, dev, swizzle=True):
+    """Load NVFP4 weight: packed uint8 + block scale + tensor scale.
+
+    Args:
+        z: weight dict
+        key: weight key
+        dev: target device
+        swizzle: if True, swizzle block scales for _scaled_mm (W4A4 path).
+                 if False, keep normal [N, K//16] layout for W4A16 dequantization.
 
     Removes the .nf4_b_scale and .nvfp4_t_scale keys from z.
-    Returns a dict with weight, block_scale (swizzled 1D), tensor_scale (scalar), qtype="nvfp4".
+    Returns a dict with weight, block_scale, tensor_scale, qtype.
     """
-    mx = _get_mx()
     w = z[key].to(device=dev).contiguous()           # [N, K//2] uint8
     bs = z[key + ".nf4_b_scale"].to(device=dev).contiguous()  # [N, K//16] float8_e4m3fn
     ts = z[key + ".nvfp4_t_scale"].to(device=dev)    # scalar float32
-    bs_swizzled = mx.to_blocked(bs)                   # 1D flat, swizzled for cuBLAS
     del z[key + ".nf4_b_scale"]
     del z[key + ".nvfp4_t_scale"]
-    return {
-        "weight": w,
-        "block_scale": bs_swizzled,
-        "tensor_scale": ts,
-        "qtype": "nvfp4",
-    }
 
-def load_fp8_weight(z, key, dev):
+    # Load AWQ scale if present
+    awq_scale = None
+    if (key + ".awq_scale") in z:
+        awq_scale = z[key + ".awq_scale"].to(device=dev)  # [K] float32
+        del z[key + ".awq_scale"]
+
+    if swizzle:
+        mx = _get_mx()
+        bs_out = mx.to_blocked(bs)                    # 1D flat, swizzled for cuBLAS
+        qtype = "nvfp4"
+    else:
+        bs_out = bs                                   # [N, K//16] normal layout
+        qtype = "nvfp4_w4a16"
+
+    result = {
+        "weight": w,
+        "block_scale": bs_out,
+        "tensor_scale": ts,
+        "qtype": qtype,
+    }
+    if awq_scale is not None:
+        result["awq_scale"] = awq_scale
+    # Load FP8 residual if present (NVFP4+FP8 residual scheme)
+    if (key + ".res_fp8") in z:
+        result["res_fp8"] = z[key + ".res_fp8"].to(device=dev).contiguous()
+        result["res_fp8_scale"] = z[key + ".res_fp8_scale"].to(device=dev)
+        del z[key + ".res_fp8"]
+        del z[key + ".res_fp8_scale"]
+        result["qtype"] = "nvfp4_res_w4a16" if qtype == "nvfp4_w4a16" else "nvfp4_res"
+    return result
+
+def load_fp8_weight(z, key, dev, w8a16=False):
     """Load FP8 weight: float8_e4m3fn + per-tensor scale.
 
+    Args:
+        z: weight dict
+        key: weight key
+        dev: target device
+        w8a16: if True, use W8A16 path (weight-only, FP16 activation).
+               if False, use W8A8 path (both weight and activation quantized).
+
     Removes the .fp8_scale key from z.
-    Returns a dict with weight, tensor_scale (scalar), qtype="fp8".
+    Returns a dict with weight, tensor_scale (scalar), qtype.
     """
     w = z[key].to(device=dev).contiguous()            # [N, K] float8_e4m3fn
     scale = z[key + ".fp8_scale"].to(device=dev)      # scalar float32
@@ -238,7 +336,7 @@ def load_fp8_weight(z, key, dev):
     return {
         "weight": w,
         "tensor_scale": scale,
-        "qtype": "fp8",
+        "qtype": "fp8_w8a16" if w8a16 else "fp8",
     }
 
 
@@ -249,11 +347,11 @@ def load_fp8_weight(z, key, dev):
 FP8_E4M3_MAX = 448.0
 
 def linear_nvfp4(x, weight_info, out_dtype=torch.float16):
-    """NVFP4 GEMM: quantize input on-the-fly using FUSED Triton kernel, then _scaled_mm.
+    """NVFP4 GEMM (W4A4): quantize input on-the-fly using FUSED Triton kernel, then _scaled_mm.
 
     Args:
         x: [B, T, K] or [M, K] fp16/bf16 input
-        weight_info: dict from load_nvfp4_weight
+        weight_info: dict from load_nvfp4_weight (swizzle=True)
         out_dtype: output dtype (default fp16 for v3a compatibility)
 
     Returns:
@@ -283,6 +381,54 @@ def linear_nvfp4(x, weight_info, out_dtype=torch.float16):
     out = out * x_ts * w_ts
 
     N = w.size(0)
+    out = out.reshape(*orig_shape[:-1], N)
+    if out_dtype != out.dtype:
+        out = out.to(out_dtype)
+    return out
+
+
+def linear_nvfp4_w4a16(x, weight_info, out_dtype=torch.float16):
+    """NVFP4 W4A16 GEMM: dequantize weight to BF16, then FP16 GEMM.
+
+    Weight-only quantization: activations stay at FP16 precision.
+    Eliminates activation quantization error (main bottleneck of W4A4).
+
+    Args:
+        x: [B, T, K] or [M, K] fp16/bf16 input
+        weight_info: dict from load_nvfp4_weight (swizzle=False)
+        out_dtype: output dtype (default fp16 for v3a compatibility)
+
+    Returns:
+        [B, T, N] or [M, N] in out_dtype
+    """
+    w_packed = weight_info["weight"]        # [N, K//2] uint8
+    w_bs = weight_info["block_scale"]       # [N, K//16] float8_e4m3fn (normal layout)
+    w_ts = weight_info["tensor_scale"]      # scalar float32
+
+    # Dequantize weight to BF16
+    w_bf16 = dequantize_nvfp4(w_packed, w_bs, w_ts)  # [N, K] bfloat16
+
+    # Add FP8 residual if present (NVFP4+FP8 residual scheme)
+    if "res_fp8" in weight_info:
+        w_bf16 = w_bf16 + weight_info["res_fp8"].to(torch.bfloat16) * weight_info["res_fp8_scale"].to(torch.bfloat16)
+
+    # Reshape input
+    orig_shape = x.shape
+    x_2d = x.reshape(-1, orig_shape[-1]).contiguous()
+
+    # Apply AWQ inverse scaling: x' = x / s
+    awq_scale = weight_info.get("awq_scale", None)
+    if awq_scale is not None:
+        x_2d = x_2d / awq_scale.to(x_2d.dtype)
+
+    # FP16 GEMM (input FP16, weight BF16→FP16)
+    if x_2d.dtype == torch.bfloat16:
+        x_2d = x_2d.to(torch.float16)
+    w_fp16 = w_bf16.to(torch.float16)
+
+    out = torch.mm(x_2d, w_fp16.t())  # [M, N]
+
+    N = w_packed.size(0)
     out = out.reshape(*orig_shape[:-1], N)
     if out_dtype != out.dtype:
         out = out.to(out_dtype)
@@ -329,9 +475,49 @@ def linear_fp8(x, weight_info, out_dtype=torch.float16):
     return out
 
 
+def linear_fp8_w8a16(x, weight_info, out_dtype=torch.float16):
+    """FP8 W8A16 GEMM: dequantize weight to FP16, then FP16 GEMM.
+
+    Weight-only quantization: activations stay at FP16 precision.
+    Eliminates FP8 activation quantization error.
+
+    Args:
+        x: [B, T, K] or [M, K] fp16/bf16 input
+        weight_info: dict from load_fp8_weight (w8a16=True)
+        out_dtype: output dtype
+
+    Returns:
+        [B, T, N] or [M, N] in out_dtype
+    """
+    w = weight_info["weight"]              # [N, K] float8_e4m3fn
+    w_scale = weight_info["tensor_scale"]  # scalar float32
+
+    # Dequantize weight: FP8 → FP16, then multiply by scale
+    w_fp16 = w.to(torch.float16) * w_scale.to(torch.float16)
+
+    # Reshape input
+    orig_shape = x.shape
+    x_2d = x.reshape(-1, orig_shape[-1]).contiguous()
+    if x_2d.dtype == torch.bfloat16:
+        x_2d = x_2d.to(torch.float16)
+
+    # FP16 GEMM
+    out = torch.mm(x_2d, w_fp16.t())  # [M, N]
+
+    N = w.size(0)
+    out = out.reshape(*orig_shape[:-1], N)
+    if out_dtype != out.dtype:
+        out = out.to(out_dtype)
+    return out
+
+
 def linear_quantized(x, weight_info, out_dtype=torch.float16):
     """Dispatcher: pick the right GEMM based on qtype in weight_info."""
     qtype = weight_info.get("qtype", "nvfp4")
     if qtype == "fp8":
         return linear_fp8(x, weight_info, out_dtype)
+    if qtype == "fp8_w8a16":
+        return linear_fp8_w8a16(x, weight_info, out_dtype)
+    if qtype in ("nvfp4_w4a16", "nvfp4_res_w4a16"):
+        return linear_nvfp4_w4a16(x, weight_info, out_dtype)
     return linear_nvfp4(x, weight_info, out_dtype)
