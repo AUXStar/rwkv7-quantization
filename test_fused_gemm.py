@@ -90,10 +90,55 @@ def test_fp8(M, K, N):
     return ok
 
 
+def test_rkv(M, K, N, k_is_fp4):
+    """r=NVFP4, k=(NVFP4|FP8), v=FP8 — fused vs per-linear reference."""
+    w_r = torch.randn(N, K, dtype=torch.bfloat16) * 0.02
+    awq_r = compute_awq_scale(w_r, act_stats=None, alpha=ALPHA)
+    p_r, bs_r, ts_r, _ = quantize_nvfp4(w_r, awq_r, per_channel_ts=False)
+
+    w_k = torch.randn(N, K, dtype=torch.bfloat16) * 0.02
+    if k_is_fp4:
+        awq_k = compute_awq_scale(w_k, act_stats=None, alpha=ALPHA)
+        p_k, bs_k, ts_k, _ = quantize_nvfp4(w_k, awq_k, per_channel_ts=False)
+    else:
+        w_k_fp8, ts_k = quantize_to_fp8(w_k)
+
+    w_v = torch.randn(N, K, dtype=torch.bfloat16) * 0.02
+    w_v_fp8, ts_v = quantize_to_fp8(w_v)
+
+    xr = torch.randn(M, K, dtype=torch.float16, device="cuda") * 0.05
+    xk = torch.randn(M, K, dtype=torch.float16, device="cuda") * 0.04
+    xv = torch.randn(M, K, dtype=torch.float16, device="cuda") * 0.03
+
+    wr_f = {"weight": p_r.to("cuda"), "block_scale": bs_r.to("cuda"), "tensor_scale": ts_r.to("cuda"),
+            "qtype": "nvfp4_fused", "awq_scale": awq_r.to("cuda")}
+    if k_is_fp4:
+        wk_f = {"weight": p_k.to("cuda"), "block_scale": bs_k.to("cuda"), "tensor_scale": ts_k.to("cuda"),
+                "qtype": "nvfp4_fused", "awq_scale": awq_k.to("cuda")}
+    else:
+        wk_f = {"weight": w_k_fp8.to("cuda"), "tensor_scale": ts_k.to("cuda"), "qtype": "fp8"}
+    wv_f = {"weight": w_v_fp8.to("cuda"), "tensor_scale": ts_v.to("cuda"), "qtype": "fp8"}
+
+    r_f, k_f, v_f = fused.linear_rkv_fused(xr, xk, xv, wr_f, wk_f, wv_f)
+    r_ref = fused.linear_nvfp4_fused(xr, wr_f)
+    k_ref = fused.linear_nvfp4_fused(xk, wk_f) if k_is_fp4 else fused.linear_fp8_fused(xk, wk_f)
+    v_ref = fused.linear_fp8_fused(xv, wv_f)
+
+    ok = True
+    for name, a, b in (("r", r_f, r_ref), ("k", k_f, k_ref), ("v", v_f, v_ref)):
+        d = (a.float() - b.float()).abs()
+        print(f"[rkv {name} M={M:>4} k_fp4={int(k_is_fp4)}] max_diff={d.max().item():.6f} mean={d.mean().item():.8f}")
+        ok &= d.max().item() < max(0.02, b.float().abs().max().item() * 0.02)
+    print(f"  -> {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
 if __name__ == "__main__":
     all_ok = True
     for M in (1, 64):
         all_ok &= test_nvfp4(M, 2048, 2048, has_awq=True, has_res=False)
         all_ok &= test_nvfp4(M, 2048, 8192, has_awq=True, has_res=True)
         all_ok &= test_fp8(M, 2048, 2048)
+        all_ok &= test_rkv(M, 2048, 2048, k_is_fp4=True)
+        all_ok &= test_rkv(M, 2048, 2048, k_is_fp4=False)
     print("\n=== ALL PASS ===" if all_ok else "\n=== SOME FAILED ===")

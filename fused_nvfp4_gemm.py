@@ -91,6 +91,78 @@ def prep_x(x, awq_scale=None, out=None):
 
 
 # ============================================================================
+# RKV fused prep: cast + AWQ + amax for xr/xk/xv in ONE launch
+# ============================================================================
+
+@triton.jit
+def prep3_x_kernel(
+    xr_ptr, xk_ptr, xv_ptr,
+    awq_r_ptr, awq_k_ptr,
+    or_ptr, ok_ptr, ov_ptr,
+    amax_r_ptr, amax_k_ptr, amax_v_ptr,
+    M, K,
+    stride_xm, stride_xk,
+    stride_om, stride_ok,
+    AWQ_R: tl.constexpr, AWQ_K: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    offs_k = tl.arange(0, BLOCK_K)
+    mask = offs_k < K
+
+    xr = tl.load(xr_ptr + pid_m * stride_xm + offs_k * stride_xk, mask=mask, other=0.0).to(tl.float32)
+    if AWQ_R:
+        awq = tl.load(awq_r_ptr + offs_k, mask=mask, other=1.0)
+        xr = xr / awq
+    tl.store(or_ptr + pid_m * stride_om + offs_k * stride_ok, xr.to(tl.bfloat16), mask=mask)
+    tl.atomic_max(amax_r_ptr, tl.max(tl.abs(xr)))
+
+    xk = tl.load(xk_ptr + pid_m * stride_xm + offs_k * stride_xk, mask=mask, other=0.0).to(tl.float32)
+    if AWQ_K:
+        awq = tl.load(awq_k_ptr + offs_k, mask=mask, other=1.0)
+        xk = xk / awq
+    tl.store(ok_ptr + pid_m * stride_om + offs_k * stride_ok, xk.to(tl.bfloat16), mask=mask)
+    tl.atomic_max(amax_k_ptr, tl.max(tl.abs(xk)))
+
+    xv = tl.load(xv_ptr + pid_m * stride_xm + offs_k * stride_xk, mask=mask, other=0.0).to(tl.float32)
+    tl.store(ov_ptr + pid_m * stride_om + offs_k * stride_ok, xv.to(tl.bfloat16), mask=mask)
+    tl.atomic_max(amax_v_ptr, tl.max(tl.abs(xv)))
+
+
+def prep3_x(xr, xk, xv, awq_r=None, awq_k=None):
+    """prep_x for three attention inputs in ONE launch.
+
+    Returns (xr_a, xk_a, xv_a, amax_r, amax_k, amax_v) all bf16/fp32 on GPU.
+    """
+    outs = []
+    amaxs = []
+    for xx in (xr, xk, xv):
+        x2 = xx.reshape(-1, xx.shape[-1])
+        if x2.dtype != torch.float16 and x2.dtype != torch.bfloat16:
+            x2 = x2.to(torch.bfloat16)
+        if x2.stride(0) != x2.size(1) or x2.stride(1) != 1:
+            x2 = x2.contiguous()
+        outs.append(torch.empty(x2.shape, dtype=torch.bfloat16, device=x2.device))
+        amaxs.append(torch.zeros(1, dtype=torch.float32, device=x2.device))
+    M, K = outs[0].shape
+    BLOCK_K = triton.next_power_of_2(K)
+    grid = (M,)
+    prep3_x_kernel[grid](
+        xr, xk, xv,
+        awq_r, awq_k,
+        outs[0], outs[1], outs[2],
+        amaxs[0], amaxs[1], amaxs[2],
+        M, K,
+        xr.stride(0), xr.stride(1),
+        outs[0].stride(0), outs[0].stride(1),
+        AWQ_R=awq_r is not None, AWQ_K=awq_k is not None,
+        BLOCK_K=BLOCK_K,
+        num_warps=4,
+    )
+    return outs[0], outs[1], outs[2], amaxs[0], amaxs[1], amaxs[2]
+
+
+# ============================================================================
 # FP4 helpers (in-kernel)
 # ============================================================================
 
@@ -372,6 +444,175 @@ def fused_fp8_gemm_kernel(
     acc = acc * (amax_v / 448.0 * w_ts_v)
     out_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :]
     tl.store(out_ptrs, acc.to(tl.float16), mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+# ============================================================================
+# Fused RKV GEMM kernel: r(NVFP4) + k(NVFP4|FP8) + v(FP8) in ONE launch
+# ============================================================================
+
+@triton.jit
+def fused_rkv_gemm_kernel(
+    xr_ptr, xk_ptr, xv_ptr,      # [M, K] bf16 (AWQ applied by prep3_x)
+    wr_ptr, wr_bs_ptr, wts_r_ptr,  # r: NVFP4 (packed FP4 + fp8 block scales)
+    wk_ptr, wk_bs_ptr, wts_k_ptr,  # k: NVFP4 (if K_IS_FP4) or FP8
+    wv_ptr, wts_v_ptr,             # v: FP8
+    amax_r_ptr, amax_k_ptr, amax_v_ptr,
+    or_ptr, ok_ptr, ov_ptr,
+    M, N, K,
+    stride_xm,
+    stride_wn, stride_wbsn, stride_wk, stride_wv, stride_om,
+    K_IS_FP4: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    offs_k2 = tl.arange(0, BLOCK_K // 2)
+    offs_nkb = tl.arange(0, BLOCK_K // 16)
+    NKB: tl.constexpr = BLOCK_K // 16
+
+    amax_r = tl.maximum(tl.load(amax_r_ptr), 1e-12)
+    amax_k = tl.maximum(tl.load(amax_k_ptr), 1e-12)
+    amax_v = tl.maximum(tl.load(amax_v_ptr), 1e-12)
+    inv_pts_r = 2688.0 / amax_r
+    inv_pts_k = 2688.0 / amax_k
+    inv_xs_k = 448.0 / amax_k
+    inv_xs_v = 448.0 / amax_v
+    wts_r = tl.load(wts_r_ptr)
+    wts_k = tl.load(wts_k_ptr)
+    wts_v = tl.load(wts_v_ptr)
+
+    acc_r = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    acc_k = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+    acc_v = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+    for k0 in range(0, tl.cdiv(K, BLOCK_K)):
+        k_start = k0 * BLOCK_K
+        kmask = (k_start + offs_k) < K
+        xmask = (offs_m[:, None] < M) & kmask[None, :]
+        wmask = (offs_n[:, None] < N)
+
+        # ---------- r: NVFP4 (FP4×FP4) ----------
+        xr = tl.load(xr_ptr + offs_m[:, None] * stride_xm + (k_start + offs_k)[None, :], mask=xmask, other=0.0)
+        xr32 = xr.to(tl.float32)
+        xr_r = tl.reshape(xr32, (BLOCK_M, NKB, 16))
+        max_r = tl.max(tl.abs(xr_r), axis=2)
+        s_r = tl.minimum(tl.maximum(max_r / 6.0 * inv_pts_r, 0.015625), 448.0).to(tl.float8e4nv).to(tl.float32)
+        xr_s = tl.minimum(tl.maximum(xr32 * _expand_blocks(inv_pts_r / s_r, BLOCK_M, NKB, BLOCK_K), -6.0), 6.0)
+        a_r = (_fp4_val(_fp4_rne(xr_s)) * _expand_blocks(s_r, BLOCK_M, NKB, BLOCK_K)).to(tl.float16)
+        w_rp = tl.load(wr_ptr + offs_n[:, None] * stride_wn + (k_start // 2 + offs_k2)[None, :],
+                       mask=wmask & ((k_start // 2 + offs_k2[None, :]) < K // 2), other=0)
+        w_rc = tl.reshape(tl.join(w_rp & 0xF, (w_rp >> 4) & 0xF), (BLOCK_N, BLOCK_K))
+        w_rbs = _e4m3_val(tl.load(wr_bs_ptr + offs_n[:, None] * stride_wbsn + (k_start // 16 + offs_nkb)[None, :],
+                                  mask=wmask & ((k_start // 16 + offs_nkb[None, :]) < K // 16), other=0))
+        b_r = (_fp4_val(w_rc) * _expand_blocks_n(w_rbs, BLOCK_N, NKB, BLOCK_K)).to(tl.float16)
+        acc_r = tl.dot(a_r, tl.trans(b_r), acc_r)
+
+        # ---------- k: NVFP4 or FP8 ----------
+        xk = tl.load(xk_ptr + offs_m[:, None] * stride_xm + (k_start + offs_k)[None, :], mask=xmask, other=0.0)
+        xk32 = xk.to(tl.float32)
+        if K_IS_FP4:
+            xk_r = tl.reshape(xk32, (BLOCK_M, NKB, 16))
+            max_k = tl.max(tl.abs(xk_r), axis=2)
+            s_k = tl.minimum(tl.maximum(max_k / 6.0 * inv_pts_k, 0.015625), 448.0).to(tl.float8e4nv).to(tl.float32)
+            xk_s = tl.minimum(tl.maximum(xk32 * _expand_blocks(inv_pts_k / s_k, BLOCK_M, NKB, BLOCK_K), -6.0), 6.0)
+            a_k = (_fp4_val(_fp4_rne(xk_s)) * _expand_blocks(s_k, BLOCK_M, NKB, BLOCK_K)).to(tl.float16)
+            w_kp = tl.load(wk_ptr + offs_n[:, None] * stride_wn + (k_start // 2 + offs_k2)[None, :],
+                           mask=wmask & ((k_start // 2 + offs_k2[None, :]) < K // 2), other=0)
+            w_kc = tl.reshape(tl.join(w_kp & 0xF, (w_kp >> 4) & 0xF), (BLOCK_N, BLOCK_K))
+            w_kbs = _e4m3_val(tl.load(wk_bs_ptr + offs_n[:, None] * stride_wbsn + (k_start // 16 + offs_nkb)[None, :],
+                                      mask=wmask & ((k_start // 16 + offs_nkb[None, :]) < K // 16), other=0))
+            b_k = (_fp4_val(w_kc) * _expand_blocks_n(w_kbs, BLOCK_N, NKB, BLOCK_K)).to(tl.float16)
+            acc_k = tl.dot(a_k, tl.trans(b_k), acc_k)
+        else:
+            a_k = tl.minimum(tl.maximum(xk32 * inv_xs_k, -448.0), 448.0).to(tl.float8e4nv).to(tl.float32).to(tl.float16)
+            w_k = _e4m3_val(tl.load(wk_ptr + offs_n[:, None] * stride_wk + (k_start + offs_k)[None, :],
+                                    mask=wmask & kmask[None, :], other=0)).to(tl.float16)
+            acc_k = tl.dot(a_k, tl.trans(w_k), acc_k)
+
+        # ---------- v: FP8 (W8A8) ----------
+        xv = tl.load(xv_ptr + offs_m[:, None] * stride_xm + (k_start + offs_k)[None, :], mask=xmask, other=0.0)
+        a_v = tl.minimum(tl.maximum(xv.to(tl.float32) * inv_xs_v, -448.0), 448.0).to(tl.float8e4nv).to(tl.float32).to(tl.float16)
+        w_v = _e4m3_val(tl.load(wv_ptr + offs_n[:, None] * stride_wv + (k_start + offs_k)[None, :],
+                                mask=wmask & kmask[None, :], other=0)).to(tl.float16)
+        acc_v = tl.dot(a_v, tl.trans(w_v), acc_v)
+
+    # fold scales
+    out_r = (acc_r * (amax_r / 2688.0 * wts_r)).to(tl.float16)
+    if K_IS_FP4:
+        out_k = (acc_k * (amax_k / 2688.0 * wts_k)).to(tl.float16)
+    else:
+        out_k = (acc_k * (amax_k / 448.0 * wts_k)).to(tl.float16)
+    out_v = (acc_v * (amax_v / 448.0 * wts_v)).to(tl.float16)
+
+    omask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    tl.store(or_ptr + offs_m[:, None] * stride_om + offs_n[None, :], out_r, mask=omask)
+    tl.store(ok_ptr + offs_m[:, None] * stride_om + offs_n[None, :], out_k, mask=omask)
+    tl.store(ov_ptr + offs_m[:, None] * stride_om + offs_n[None, :], out_v, mask=omask)
+
+
+def linear_rkv_fused(xr, xk, xv, wr_info, wk_info, wv_info, out_dtype=torch.float16):
+    """Fused r/k/v attention projections: 2 launches (prep3_x + GEMM).
+
+    wr_info: NVFP4 dict (qtype nvfp4_fused)
+    wk_info: NVFP4 (nvfp4_fused) or FP8 (fp8) dict
+    wv_info: FP8 dict
+    Returns (r, k, v) each shaped like xr (e.g. [B, T, C]).
+    """
+    orig_shape = xr.shape
+    xr_a, xk_a, xv_a, amax_r, amax_k, amax_v = prep3_x(
+        xr, xk, xv,
+        wr_info.get("awq_scale", None),
+        wk_info.get("awq_scale", None),
+    )
+    M, K = xr_a.shape
+    N = wr_info["weight"].size(0)
+
+    or_ = torch.empty(M, N, dtype=torch.float16, device=xr_a.device)
+    ok_ = torch.empty(M, N, dtype=torch.float16, device=xr_a.device)
+    ov_ = torch.empty(M, N, dtype=torch.float16, device=xr_a.device)
+
+    k_is_fp4 = wk_info.get("qtype", "fp8") == "nvfp4_fused"
+    if k_is_fp4:
+        wk_arg, wk_bs_arg = wk_info["weight"], wk_info["block_scale"].view(torch.uint8)
+    else:
+        wk_arg, wk_bs_arg = wk_info["weight"].view(torch.uint8), wk_info["weight"].view(torch.uint8)  # bs unused
+    bm, bn, bk, nw = _nvfp4_cfg_for(M)
+    grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),)
+    fused_rkv_gemm_kernel[grid](
+        xr_a, xk_a, xv_a,
+        wr_info["weight"], wr_info["block_scale"].view(torch.uint8), wr_info["tensor_scale"],
+        wk_arg, wk_bs_arg, wk_info["tensor_scale"],
+        wv_info["weight"].view(torch.uint8), wv_info["tensor_scale"],
+        amax_r, amax_k, amax_v,
+        or_, ok_, ov_,
+        M, N, K,
+        xr_a.stride(0),
+        wr_info["weight"].stride(0), wr_info["block_scale"].stride(0),
+        wk_arg.stride(0) if not k_is_fp4 else wr_info["weight"].stride(0),
+        wv_info["weight"].stride(0),
+        or_.stride(0),
+        K_IS_FP4=k_is_fp4,
+        BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=8,
+        num_warps=nw,
+    )
+    if out_dtype != torch.float16:
+        or_, ok_, ov_ = or_.to(out_dtype), ok_.to(out_dtype), ov_.to(out_dtype)
+    or_ = or_.reshape(*orig_shape[:-1], N)
+    ok_ = ok_.reshape(*orig_shape[:-1], N)
+    ov_ = ov_.reshape(*orig_shape[:-1], N)
+    return or_, ok_, ov_
 
 
 # ============================================================================
