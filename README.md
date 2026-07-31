@@ -263,3 +263,57 @@ for key, tensor in checkpoint.items():
 
 做为AI请从当前进度继续。
 并且主动在issue区进行讨论
+
+
+## 当前量化方案（1.5B 最终，Task 1-4 迭代后）
+
+```
+component:   key         value    rec      out      ffn_k           ffn_v   lowrank
+Layer 0:     bf16        fp8      nvfp4    nvfp4    nvfp4+fp8残差    fp8     bf16
+Layer 1-23:  fp8         fp8      nvfp4    nvfp4    nvfp4+fp8残差    fp8     bf16
+```
+
+| 指标 | 目标 | 实际 | 状态 |
+|------|------|------|------|
+| MATH500 | ≥12.0% (gap≤0.6pp) | 11.2% (gap 1.4pp) | ✗ 差0.8pp |
+| MATH500 验收线 | ≤2pp | 1.4pp | ✅ |
+| PPL delta (1024/8192) | ≤0.05 | 0.028/0.002 | ✅ |
+| 显存 | ≤2.0 GiB | 1.87 GiB | ✅ |
+| decode | ≥65 t/s | 70 t/s | ✅ |
+| 8192 state MSE L23 | 与FP16持平 | 6.81e-3 | ✅ |
+
+设计原则：**全链路量化域执行，无运行时反量化**。
+- 权重静态量化（离线算scale存盘）；激活动态量化（prep_x实时amax、
+  fused kernel per-16-block动态scale）
+- 残差per-block FP8走纯FP8×FP8 GEMM（dispatcher对残差权重强制fused kernel，
+  因为 _scaled_mm 无法混合 fp32 tensor x-scale + fp8 block w-scale）
+- AWQ alpha=0.3（grid search 7点，PPL几乎不变但MATH500 +2.6pp）
+- 低秩(8×/层)保持bf16：只占1.7%内存，量化收益配不上精度
+
+### 关键实验发现
+
+1. **PPL 不预测 MATH500**：alpha 对 PPL 无影响(3.4219 vs 3.4224)但对解题 +2.6pp
+2. **推理轨迹早期分叉**：量化模型第16个token即与原模型分歧(Q3)，之后
+   质因数分解错误(196=2²×7¹×11⁰)一路错到底——不是答案边缘抖动
+3. **state 存储 fp16 不变但承载量化误差**：k/v 由量化权重产生，误差渗透
+   state 数值；8192长度 L23 MSE=6.81e-3 不累积
+4. **低秩量化不划算**：FP8后磁盘省1.7%、运行时收益0、PPL+0.0052 → 回退bf16
+
+## 研究方向（issue #12：逐层/逐头敏感度归因）
+
+当前方案是"组件级经验分层"，层边界非逐层数据驱动（2.9B方案甚至直接缩放1.5B）。
+下一步按数据驱动重新设计：
+
+1. **逐层归因**：24次"单层量化其余bf16"PPL扫描 → 层敏感度曲线
+2. **选择性量化**：基于曲线选量化层集合 → 精度-节省 Pareto 前沿
+   （验证 bf16+nvfp4+bf16 交替是否成立）
+3. **逐头归因**：若attention路径是主要误差源 → 中间层内32头归因
+   （head×layer 才是理论最小粒度，per-head tensor scale 零成本）
+4. **2.9B 重新归因**：不同参数量敏感度模式不同，不缩放
+
+### 讨论共识
+
+- 粒度：head×layer(768) > layer(24) > 组件(6)，但需先验证头间异质性
+- 交替：bf16层=校准点（ln/残差重新归一化），但盲交替不如数据选择
+- 动态量化：(a)激活动态 ✅ 已做；(b)逐层动态精度选择 ❌ 未做
+- 模型规模：小模型冗余低→敏感度平；大模型中间层冗余高→选择性量化空间大
