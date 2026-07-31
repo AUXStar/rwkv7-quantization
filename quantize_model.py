@@ -279,7 +279,7 @@ def get_dtype_for(rules, layer, comp):
 # Main quantization pipeline
 # ============================================================================
 
-def quantize_model(model_path, output_path, scheme_name="1.5b", device='cuda'):
+def quantize_model(model_path, output_path, scheme_name="1.5b", device='cuda', _scheme_override=None):
     """Quantize a model according to the specified scheme."""
     print(f"Loading model: {model_path}", flush=True)
     z = torch.load(model_path, map_location="cpu", mmap=True)
@@ -290,11 +290,15 @@ def quantize_model(model_path, output_path, scheme_name="1.5b", device='cuda'):
     print(f"Model: {num_layers} layers", flush=True)
     
     # Get scheme
-    scheme_fn = SCHEMES.get(scheme_name)
-    if scheme_fn is None:
-        print(f"Unknown scheme: {scheme_name}. Available: {list(SCHEMES.keys())}")
-        return
-    rules = scheme_fn()
+    if _scheme_override is not None:
+        rules = _scheme_override
+        scheme_name = "custom"
+    else:
+        scheme_fn = SCHEMES.get(scheme_name)
+        if scheme_fn is None:
+            print(f"Unknown scheme: {scheme_name}. Available: {list(SCHEMES.keys())}")
+            return
+        rules = scheme_fn()
     
     # Print scheme
     print(f"\nQuantization scheme: {scheme_name}", flush=True)
