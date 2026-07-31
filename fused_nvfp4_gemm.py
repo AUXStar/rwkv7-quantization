@@ -317,14 +317,16 @@ def fused_nvfp4_res_gemm_kernel(
     w_bs_ptr,        # [N, K//16] uint8 (fp8 block scales)
     w_ts_ptr,        # fp32 scalar (main per-tensor scale)
     res_w_ptr,       # [N, K] uint8 (fp8 residual weights)
-    res_ts_ptr,      # fp32 scalar (residual per-tensor scale)
+    res_bs_ptr,      # [N, K//16] uint8 (fp8 residual block scales) or dummy
+    res_ts_ptr,      # fp32 scalar (residual per-tensor scale; unused if RES_BLOCK)
     amax_ptr,        # fp32 scalar (activation amax)
     out_ptr,         # [M, N] fp16 output
     M, N, K,
     stride_xm,
-    stride_wn, stride_wbsn, stride_resn, stride_om,
+    stride_wn, stride_wbsn, stride_resn, stride_rbsn, stride_om,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
+    RES_BLOCK: tl.constexpr,
 ):
     pid = tl.program_id(0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -382,12 +384,19 @@ def fused_nvfp4_res_gemm_kernel(
         b_eff = (b_val * _expand_blocks_n(bs_b, BLOCK_N, NKB, BLOCK_K)).to(tl.float16)
         acc_main = tl.dot(a_eff, tl.trans(b_eff), acc_main)
 
-        # --- residual: FP8 path (same x tile, per-tensor scale) ---
+        # --- residual: FP8 path (same x tile) ---
         x_fp8 = tl.minimum(tl.maximum(x32 * inv_xs, -448.0), 448.0)
         a_r = x_fp8.to(tl.float8e4nv).to(tl.float32).to(tl.float16)  # [BM, BK]
         res_u8 = tl.load(res_w_ptr + offs_n[:, None] * stride_resn + (k_start + offs_k)[None, :],
                          mask=(offs_n[:, None] < N) & kmask[None, :], other=0)
-        b_r = _e4m3_val(res_u8).to(tl.float16)  # [BN, BK]
+        b_r0 = _e4m3_val(res_u8)  # [BN, BK] fp32
+        if RES_BLOCK:
+            rbs_u8 = tl.load(res_bs_ptr + offs_n[:, None] * stride_rbsn + (k_start // 16 + offs_nkb)[None, :],
+                             mask=(offs_n[:, None] < N) & ((k_start // 16 + offs_nkb[None, :]) < K // 16), other=0)
+            rbs_f = _e4m3_val(rbs_u8)
+            b_r = (b_r0 * _expand_blocks_n(rbs_f, BLOCK_N, NKB, BLOCK_K)).to(tl.float16)
+        else:
+            b_r = b_r0.to(tl.float16)
         acc_res = tl.dot(a_r, tl.trans(b_r), acc_res)
 
     out = acc_main * (amax_v / 2688.0 * w_ts_v) + acc_res * (amax_v / 448.0 * res_ts_v)
@@ -666,13 +675,15 @@ def linear_nvfp4_fused(x, weight_info, out_dtype=torch.float16):
 def linear_nvfp4_res_fused(x, weight_info, out_dtype=torch.float16):
     """Fused NVFP4+FP8 residual GEMM (W4A4+W8A8): ONE kernel.
 
-    weight_info: unswizzled block scales + res_fp8 + res_fp8_scale.
+    weight_info: unswizzled block scales + res_fp8 + res_fp8_scale (legacy)
+    or res_block_scale (Task 3 per-block).
     """
     w = weight_info["weight"]
     w_bs = weight_info["block_scale"]
     w_ts = weight_info["tensor_scale"]
     res_w = weight_info["res_fp8"]           # [N, K] fp8
-    res_ts = weight_info["res_fp8_scale"]
+    res_bs = weight_info.get("res_block_scale")          # [N, K//16] or None
+    res_ts = weight_info.get("res_fp8_scale") if res_bs is None else None
 
     x_awq, amax = prep_x(x, weight_info.get("awq_scale", None))
     M, K = x_awq.shape
@@ -681,14 +692,18 @@ def linear_nvfp4_res_fused(x, weight_info, out_dtype=torch.float16):
     out = torch.empty(M, N, dtype=torch.float16, device=x_awq.device)
     bm, bn, bk, nw = _nvfp4_cfg_for(M)
     grid = lambda meta: (triton.cdiv(M, meta["BLOCK_M"]) * triton.cdiv(N, meta["BLOCK_N"]),)
+    rbs_arg = res_bs.view(torch.uint8) if res_bs is not None else amax.view(torch.uint8)
+    rts_arg = weight_info.get("res_fp8_scale") if res_bs is not None else res_ts
     fused_nvfp4_res_gemm_kernel[grid](
         x_awq, w, w_bs.view(torch.uint8), w_ts,
-        res_w.view(torch.uint8), res_ts, amax, out,
+        res_w.view(torch.uint8), rbs_arg, rts_arg, amax, out,
         M, N, K,
         x_awq.stride(0),
         w.stride(0), w_bs.stride(0), res_w.stride(0),
+        res_bs.stride(0) if res_bs is not None else 0,
         out.stride(0),
         BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=8,
+        RES_BLOCK=res_bs is not None,
         num_warps=nw,
     )
 
@@ -751,6 +766,10 @@ def linear_quantized_fused(x, weight_info, out_dtype=torch.float16):
         # nvfp4_fused
         return linear_nvfp4_fused(x, weight_info, out_dtype)
     # Large M: _scaled_mm (needs swizzled scales)
+    if "res_block_scale" in weight_info:
+        # per-block residual: fused kernel at any M (quantized-domain FP8xFP8,
+        # _scaled_mm can't mix fp32 tensor x-scale with fp8 block w-scale)
+        return linear_nvfp4_res_fused(x, weight_info, out_dtype)
     wi = dict(weight_info)
     if qtype in ("nvfp4_fused", "nvfp4_res_fused"):
         wi["block_scale"] = wi["block_scale_sw"]

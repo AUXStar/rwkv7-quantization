@@ -132,8 +132,14 @@ def quantize_nvfp4(w, awq_scale, per_channel_ts=False, device='cuda'):
     return packed.cpu(), best_bs_fp8.cpu(), ts.cpu(), w_quant.cpu()
 
 
-def quantize_to_fp8(w):
-    """Per-tensor FP8 E4M3 quantization."""
+def quantize_to_fp8(w, per_channel=False):
+    """FP8 E4M3 quantization. per_channel=True -> per-column scale [N]."""
+    if per_channel:
+        amax = w.abs().amax(dim=0)  # [N] per output column
+        scale = (amax / FP8_E4M3_MAX).float()
+        scale = scale.clamp(min=1e-10)
+        w_fp8 = (w.float() / scale.unsqueeze(0)).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+        return w_fp8, scale
     amax = w.abs().max()
     scale = (amax / FP8_E4M3_MAX).float() if amax > 0 else torch.tensor(1.0, dtype=torch.float32)
     w_fp8 = (w.float() / scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
@@ -142,14 +148,25 @@ def quantize_to_fp8(w):
 
 def quantize_nvfp4_with_residual(w, awq_scale, device='cuda'):
     """NVFP4 + FP8 residual quantization (v12 scheme).
-    Returns: packed, bs, ts, awq_scale, res_fp8, res_scale
+    Task 3: residual uses per-block (16-elem) FP8 scales instead of per-tensor.
+    Returns: packed, bs, ts, awq_scale, res_fp8, res_block_scale
     """
     packed, bs, ts, w_nvfp4_deq = quantize_nvfp4(w, awq_scale, per_channel_ts=False, device=device)
     # Residual in AWQ-scaled space
     W_awq = (w.to(device).float() * awq_scale.to(device).float().unsqueeze(0)).cpu()
     residual = W_awq - w_nvfp4_deq
-    res_fp8, res_scale = quantize_to_fp8(residual)
-    return packed, bs, ts, awq_scale, res_fp8, res_scale
+    N, K = residual.shape
+    n_blocks = K // BLOCK_SIZE
+    # Task 3: per-block residual scales (NVFP4-like: tensor scale + block RATIO)
+    global_amax = residual.abs().max().clamp(min=1e-10)
+    res_scale = (global_amax / FP8_E4M3_MAX).float()                  # tensor scale
+    r_blocks = residual.view(N, n_blocks, BLOCK_SIZE)
+    block_amax = r_blocks.abs().amax(dim=2)                           # [N, K/16]
+    ratio = (block_amax / global_amax).clamp(min=0.0025, max=1.0)     # fp8-subnormal-safe
+    res_bs = ratio.to(torch.float8_e4m3fn)                            # [N, K/16] fp8
+    res_fp8 = (r_blocks / (res_scale * res_bs.to(torch.float32).unsqueeze(-1))).clamp(
+        -FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+    return packed, bs, ts, awq_scale, res_fp8.reshape(N, K), res_bs, res_scale
 
 
 # ============================================================================
@@ -167,10 +184,9 @@ def get_scheme_1_5b():
     """
     return [
         # [layer_start, layer_end, comp, dtype]
-        # Attention key: FP8 at edges, NVFP4 in middle
-        [0,  3,  1, FP8],      # L0-3 key FP8
-        [4,  19, 1, NVFP4],    # L4-19 key NVFP4
-        [20, 23, 1, FP8],      # L20-23 key FP8
+        # Attention key: L0 bf16, L1-23 FP8 (Task 2: key全面FP8, 修复MATH500主力)
+        [0,  0,  1, BF16],     # L0 key bf16
+        [1,  23, 1, FP8],      # L1-23 key FP8
         # Attention value: FP8 everywhere (more sensitive than key)
         [0,  23, 2, FP8],
         # Receptance + output: NVFP4 everywhere (low sensitivity)
@@ -255,6 +271,7 @@ def classify_weight(key, num_layers):
         comp_name = parts[3]
         if comp_name in COMP_MAP and key.endswith(".weight"):
             return (layer, COMP_MAP[comp_name])
+
     
     # Check if it's an FFN weight
     if len(parts) >= 4 and parts[2] == "ffn":
@@ -358,12 +375,13 @@ def quantize_model(model_path, output_path, scheme_name="1.5b", device='cuda', _
             total_quant += packed.numel() * 0.5 + bs.numel() * 1 + 4 + awq_s.numel() * 4
             
         elif dtype == NVFP4_RES:
-            packed, bs, ts, awq_s, res_fp8, res_scale = quantize_nvfp4_with_residual(w, awq_s, device=device)
+            packed, bs, ts, awq_s, res_fp8, res_bs, res_scale = quantize_nvfp4_with_residual(w, awq_s, device=device)
             z[key] = packed.contiguous()
             z[key + ".nf4_b_scale"] = bs.contiguous()
             z[key + ".nvfp4_t_scale"] = ts.contiguous()
             z[key + ".awq_scale"] = awq_s.contiguous()
             z[key + ".res_fp8"] = res_fp8.contiguous()
+            z[key + ".res_bs"] = res_bs.contiguous()
             z[key + ".res_fp8_scale"] = res_scale.contiguous()
             stats["nvfp4_res"] += 1
             total_quant += packed.numel() * 0.5 + bs.numel() * 1 + 4 + awq_s.numel() * 4

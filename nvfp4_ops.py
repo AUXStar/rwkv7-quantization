@@ -315,9 +315,20 @@ def load_nvfp4_weight(z, key, dev, swizzle=True, fused=False):
     # Load FP8 residual if present (NVFP4+FP8 residual scheme)
     if (key + ".res_fp8") in z:
         result["res_fp8"] = z[key + ".res_fp8"].to(device=dev).contiguous()
-        result["res_fp8_scale"] = z[key + ".res_fp8_scale"].to(device=dev)
+        if (key + ".res_bs") in z:
+            # Task 3: per-block residual scales [N, K//16] fp8 (ratio)
+            rbs = z[key + ".res_bs"].to(device=dev).contiguous()
+            result["res_block_scale"] = rbs                       # [N, K//16]
+            result["res_block_scale_sw"] = _get_mx().to_blocked(rbs).contiguous()
+            del z[key + ".res_bs"]
+            if (key + ".res_fp8_scale") in z:
+                result["res_fp8_scale"] = z[key + ".res_fp8_scale"].to(device=dev)
+                del z[key + ".res_fp8_scale"]
+        else:
+            # legacy per-tensor residual scale
+            result["res_fp8_scale"] = z[key + ".res_fp8_scale"].to(device=dev)
+            del z[key + ".res_fp8_scale"]
         del z[key + ".res_fp8"]
-        del z[key + ".res_fp8_scale"]
         if qtype == "nvfp4":
             result["qtype"] = "nvfp4_res"
         elif qtype == "nvfp4_fused":
@@ -399,18 +410,35 @@ def linear_nvfp4(x, weight_info, out_dtype=torch.float16):
     # Residual is in AWQ-scaled space, same x_2d already has AWQ applied
     if "res_fp8" in weight_info:
         res_w = weight_info["res_fp8"]           # [N, K] float8_e4m3fn
-        res_scale = weight_info["res_fp8_scale"] # scalar fp32
-        # FP8×FP8→BF16 GEMM for residual (W8A8, no dequantization)
-        amax_x = x_2d.abs().max()
-        if amax_x > 0:
-            x_scale = (amax_x / FP8_E4M3_MAX).float()
+        if "res_block_scale" in weight_info:
+            # Task 3: per-block residual — pure FP8xFP8 GEMM in quantized domain.
+            # scale_b = swizzled per-block fp8 scales, scale_a = tensor (res_ts).
+            amax_x = x_2d.abs().max()
+            if amax_x > 0:
+                x_scale = (amax_x / FP8_E4M3_MAX).float()
+            else:
+                x_scale = torch.tensor(1.0, dtype=torch.float32, device=x_2d.device)
+            x_fp8 = (x_2d.float() / x_scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+            res_bs_sw = weight_info["res_block_scale_sw"]  # swizzled [N*K/16] fp8
+            res_ts = weight_info["res_fp8_scale"]
+            # scale_b = fp8 block ratios; tensor scale folded after GEMM (NVFP4-style)
+            res_out = torch._scaled_mm(x_fp8, res_w.t(),
+                scale_a=x_scale.reshape(1), scale_b=res_bs_sw,
+                out_dtype=torch.bfloat16)
+            out = out + res_out * res_ts.float()
         else:
-            x_scale = torch.tensor(1.0, dtype=torch.float32, device=x_2d.device)
-        x_fp8 = (x_2d.float() / x_scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
-        res_out = torch._scaled_mm(x_fp8, res_w.t(),
-            scale_a=x_scale.reshape(1), scale_b=res_scale.reshape(1),
-            out_dtype=torch.bfloat16)
-        out = out + res_out
+            res_scale = weight_info["res_fp8_scale"] # scalar fp32
+            # FP8×FP8→BF16 GEMM for residual (W8A8, no dequantization)
+            amax_x = x_2d.abs().max()
+            if amax_x > 0:
+                x_scale = (amax_x / FP8_E4M3_MAX).float()
+            else:
+                x_scale = torch.tensor(1.0, dtype=torch.float32, device=x_2d.device)
+            x_fp8 = (x_2d.float() / x_scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+            res_out = torch._scaled_mm(x_fp8, res_w.t(),
+                scale_a=x_scale.reshape(1), scale_b=res_scale.reshape(1),
+                out_dtype=torch.bfloat16)
+            out = out + res_out
 
     N = w.size(0)
     out = out.reshape(*orig_shape[:-1], N)
@@ -442,7 +470,15 @@ def linear_nvfp4_w4a16(x, weight_info, out_dtype=torch.float16):
 
     # Add FP8 residual if present (NVFP4+FP8 residual scheme)
     if "res_fp8" in weight_info:
-        w_bf16 = w_bf16 + weight_info["res_fp8"].to(torch.bfloat16) * weight_info["res_fp8_scale"].to(torch.bfloat16)
+        if "res_block_scale" in weight_info:
+            res_bs = weight_info["res_block_scale"]
+            n_b = res_bs.shape[1]
+            rbs_exp = res_bs.float().unsqueeze(-1).repeat(1, 1, 16).reshape(weight_info["res_fp8"].shape)
+            ts_r = weight_info["res_fp8_scale"].float()
+            res_deq = (weight_info["res_fp8"].float() * rbs_exp * ts_r).to(torch.bfloat16)
+            w_bf16 = w_bf16 + res_deq
+        else:
+            w_bf16 = w_bf16 + weight_info["res_fp8"].to(torch.bfloat16) * weight_info["res_fp8_scale"].to(torch.bfloat16)
 
     # Reshape input
     orig_shape = x.shape
