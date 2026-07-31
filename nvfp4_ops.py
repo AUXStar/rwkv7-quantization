@@ -560,29 +560,14 @@ def linear_quantized_fused(x, weight_info, out_dtype=torch.float16):
     """Hybrid dispatcher for quantized GEMMs.
 
     - M <= FUSED_M_MAX (decode/small batch): single-kernel fused GEMM
-      (nvfp4_fused / nvfp4_res_fused / fp8) — eliminates launch + memory round-trips.
+      (nvfp4_fused / nvfp4_res_fused / fp8) — 2 launches per linear (prep_x + GEMM).
     - M > FUSED_M_MAX (prefill/large batch): _scaled_mm path
       (swizzled scales from block_scale_sw) — cuBLAS wins for large M.
 
     Requires block scales in [N, K//16] unswizzled layout (load with fused=True).
     """
-    from fused_nvfp4_gemm import linear_nvfp4_fused, linear_fp8_fused
-    qtype = weight_info.get("qtype", "nvfp4")
-    M = x.numel() // x.size(-1)
-    if M <= FUSED_M_MAX:
-        if qtype == "fp8":
-            return linear_fp8_fused(x, weight_info, out_dtype)
-        # nvfp4_fused / nvfp4_res_fused
-        return linear_nvfp4_fused(x, weight_info, out_dtype)
-    # Large M: fall back to _scaled_mm (needs swizzled scales)
-    wi = dict(weight_info)
-    if qtype in ("nvfp4_fused", "nvfp4_res_fused"):
-        wi["block_scale"] = wi["block_scale_sw"]
-        wi["qtype"] = "nvfp4_res" if qtype == "nvfp4_res_fused" else "nvfp4"
-        return linear_nvfp4(x, wi, out_dtype)
-    if qtype == "fp8":
-        return linear_fp8(x, wi, out_dtype)
-    return linear_nvfp4(x, wi, out_dtype)
+    from fused_nvfp4_gemm import linear_quantized_fused as _dispatch
+    return _dispatch(x, weight_info, out_dtype)
 
 
 FUSED_M_MAX = 64  # use fused single-kernel GEMM when M <= this (decode/small-batch domain)
