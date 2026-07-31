@@ -282,7 +282,7 @@ def get_dtype_for(rules, layer, comp):
 def quantize_model(model_path, output_path, scheme_name="1.5b", device='cuda'):
     """Quantize a model according to the specified scheme."""
     print(f"Loading model: {model_path}", flush=True)
-    z = torch.load(model_path, map_location="cpu")
+    z = torch.load(model_path, map_location="cpu", mmap=True)
     
     # Detect number of layers
     layer_keys = [k for k in z.keys() if k.startswith("blocks.")]
@@ -394,6 +394,10 @@ def quantize_model(model_path, output_path, scheme_name="1.5b", device='cuda'):
     print(f"  BF16: {stats['bf16']}, FP8: {stats['fp8']}, NVFP4: {stats['nvfp4']}, NVFP4+res: {stats['nvfp4_res']}", flush=True)
     print(f"  Original: {total_orig/2**30:.2f} GB → Quantized: {total_quant/2**30:.2f} GB ({total_orig/max(total_quant,1):.1f}x compression)", flush=True)
     
+    # Clone all tensors to detach from mmap (prevents file bloat)
+    for _k in list(z.keys()):
+        if torch.is_tensor(z[_k]):
+            z[_k] = z[_k].clone()
     torch.save(z, output_path)
     print(f"  Saved to: {output_path}", flush=True)
     
