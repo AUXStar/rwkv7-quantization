@@ -134,26 +134,31 @@ def prep3_x(xr, xk, xv, awq_r=None, awq_k=None):
 
     Returns (xr_a, xk_a, xv_a, amax_r, amax_k, amax_v) all bf16/fp32 on GPU.
     """
+    # CRITICAL: each input must be contiguous — kernel indexes all three with
+    # one stride set; non-contiguous views (e.g. tmix_mix6 outputs) would be
+    # read at wrong offsets (NaN / garbage amax).
+    def _prep1(xx):
+        x2 = xx.reshape(-1, xx.shape[-1])
+        if x2.dtype not in (torch.float16, torch.bfloat16):
+            x2 = x2.to(torch.bfloat16)
+        return x2.contiguous()
+    xr2, xk2, xv2 = _prep1(xr), _prep1(xk), _prep1(xv)
+
     outs = []
     amaxs = []
-    for xx in (xr, xk, xv):
-        x2 = xx.reshape(-1, xx.shape[-1])
-        if x2.dtype != torch.float16 and x2.dtype != torch.bfloat16:
-            x2 = x2.to(torch.bfloat16)
-        if x2.stride(0) != x2.size(1) or x2.stride(1) != 1:
-            x2 = x2.contiguous()
-        outs.append(torch.empty(x2.shape, dtype=torch.bfloat16, device=x2.device))
-        amaxs.append(torch.zeros(1, dtype=torch.float32, device=x2.device))
+    for xx in (xr2, xk2, xv2):
+        outs.append(torch.empty(xx.shape, dtype=torch.bfloat16, device=xx.device))
+        amaxs.append(torch.zeros(1, dtype=torch.float32, device=xx.device))
     M, K = outs[0].shape
     BLOCK_K = triton.next_power_of_2(K)
     grid = (M,)
     prep3_x_kernel[grid](
-        xr, xk, xv,
+        xr2, xk2, xv2,
         awq_r, awq_k,
         outs[0], outs[1], outs[2],
         amaxs[0], amaxs[1], amaxs[2],
         M, K,
-        xr.stride(0), xr.stride(1),
+        xr2.stride(0), xr2.stride(1),
         outs[0].stride(0), outs[0].stride(1),
         AWQ_R=awq_r is not None, AWQ_K=awq_k is not None,
         BLOCK_K=BLOCK_K,
