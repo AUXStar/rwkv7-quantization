@@ -267,7 +267,7 @@ def is_fp8_weight(z, key):
 # Loading
 # ============================================================================
 
-def load_nvfp4_weight(z, key, dev, swizzle=True):
+def load_nvfp4_weight(z, key, dev, swizzle=True, fused=False):
     """Load NVFP4 weight: packed uint8 + block scale + tensor scale.
 
     Args:
@@ -275,7 +275,8 @@ def load_nvfp4_weight(z, key, dev, swizzle=True):
         key: weight key
         dev: target device
         swizzle: if True, swizzle block scales for _scaled_mm (W4A4 path).
-                 if False, keep normal [N, K//16] layout for W4A16 dequantization.
+                 if False, keep normal [N, K//16] layout.
+        fused: if True, mark qtype for fused single-kernel GEMM (uses [N,K//16] layout).
 
     Removes the .nf4_b_scale and .nvfp4_t_scale keys from z.
     Returns a dict with weight, block_scale, tensor_scale, qtype.
@@ -298,7 +299,7 @@ def load_nvfp4_weight(z, key, dev, swizzle=True):
         qtype = "nvfp4"
     else:
         bs_out = bs                                   # [N, K//16] normal layout
-        qtype = "nvfp4_w4a16"
+        qtype = "nvfp4_fused" if fused else "nvfp4_w4a16"
 
     result = {
         "weight": w,
@@ -306,6 +307,9 @@ def load_nvfp4_weight(z, key, dev, swizzle=True):
         "tensor_scale": ts,
         "qtype": qtype,
     }
+    if fused:
+        # Keep swizzled copy for _scaled_mm fallback (prefill routing)
+        result["block_scale_sw"] = _get_mx().to_blocked(bs).contiguous()
     if awq_scale is not None:
         result["awq_scale"] = awq_scale
     # Load FP8 residual if present (NVFP4+FP8 residual scheme)
@@ -314,7 +318,12 @@ def load_nvfp4_weight(z, key, dev, swizzle=True):
         result["res_fp8_scale"] = z[key + ".res_fp8_scale"].to(device=dev)
         del z[key + ".res_fp8"]
         del z[key + ".res_fp8_scale"]
-        result["qtype"] = "nvfp4_res_w4a16" if qtype == "nvfp4_w4a16" else "nvfp4_res"
+        if qtype == "nvfp4":
+            result["qtype"] = "nvfp4_res"
+        elif qtype == "nvfp4_fused":
+            result["qtype"] = "nvfp4_res_fused"
+        else:
+            result["qtype"] = "nvfp4_res_w4a16"
     return result
 
 def load_fp8_weight(z, key, dev, w8a16=False):
@@ -545,3 +554,35 @@ def linear_quantized(x, weight_info, out_dtype=torch.float16):
         return linear_nvfp4_w4a16(x, weight_info, out_dtype)
     # nvfp4 and nvfp4_res both use W4A4 quantized GEMM (no dequantization)
     return linear_nvfp4(x, weight_info, out_dtype)
+
+
+def linear_quantized_fused(x, weight_info, out_dtype=torch.float16):
+    """Hybrid dispatcher for quantized GEMMs.
+
+    - M <= FUSED_M_MAX (decode/small batch): single-kernel fused GEMM
+      (nvfp4_fused / nvfp4_res_fused / fp8) — eliminates launch + memory round-trips.
+    - M > FUSED_M_MAX (prefill/large batch): _scaled_mm path
+      (swizzled scales from block_scale_sw) — cuBLAS wins for large M.
+
+    Requires block scales in [N, K//16] unswizzled layout (load with fused=True).
+    """
+    from fused_nvfp4_gemm import linear_nvfp4_fused, linear_fp8_fused
+    qtype = weight_info.get("qtype", "nvfp4")
+    M = x.numel() // x.size(-1)
+    if M <= FUSED_M_MAX:
+        if qtype == "fp8":
+            return linear_fp8_fused(x, weight_info, out_dtype)
+        # nvfp4_fused / nvfp4_res_fused
+        return linear_nvfp4_fused(x, weight_info, out_dtype)
+    # Large M: fall back to _scaled_mm (needs swizzled scales)
+    wi = dict(weight_info)
+    if qtype in ("nvfp4_fused", "nvfp4_res_fused"):
+        wi["block_scale"] = wi["block_scale_sw"]
+        wi["qtype"] = "nvfp4_res" if qtype == "nvfp4_res_fused" else "nvfp4"
+        return linear_nvfp4(x, wi, out_dtype)
+    if qtype == "fp8":
+        return linear_fp8(x, wi, out_dtype)
+    return linear_nvfp4(x, wi, out_dtype)
+
+
+FUSED_M_MAX = 64  # use fused single-kernel GEMM when M <= this (decode/small-batch domain)
