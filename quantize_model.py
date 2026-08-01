@@ -216,6 +216,23 @@ def get_scheme_1_5b_l0l23():
     ]
 
 
+def get_scheme_1_5b_m2():
+    """1.5B 最终定稿 (M2): L0-5 + L18-23 全bf16保护带, L6-17 量化。
+
+    MATH500 12.4% (62/500, 达标12.0%), delta 0.2pp (gap<=0.6pp PASS)
+    依据: 归因实验 — L0保护(v_first源头)必须; M2窗口 L6-17 最优
+    """
+    return [
+        [6,  17, 1, FP8],        # key L6-17 FP8
+        [6,  17, 2, FP8],        # value L6-17 FP8
+        [6,  17, 0, NVFP4],      # rec L6-17 NVFP4
+        [6,  17, 3, NVFP4],      # out L6-17 NVFP4
+        [6,  17, 4, NVFP4_RES],  # ffn_k L6-17 NVFP4+FP8残差
+        [6,  17, 5, FP8],        # ffn_v L6-17 FP8
+        # L0-5, L18-23: 默认bf16 (保护带)
+    ]
+
+
 def get_scheme_2_9b():
     """Scheme for 2.9B (32 layers), scaled from 1.5B findings."""
     return [
@@ -262,6 +279,7 @@ def get_scheme_fp8():
 SCHEMES = {
     "1.5b": get_scheme_1_5b,
     "1.5b-l0l23": get_scheme_1_5b_l0l23,
+    "1.5b-m2-final": get_scheme_1_5b_m2,
     "2.9b": get_scheme_2_9b,
     "experimental": get_scheme_experimental,
     "fp8": get_scheme_fp8,
