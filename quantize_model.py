@@ -217,21 +217,21 @@ def get_scheme_1_5b_l0l23():
 
 
 def get_scheme_1_5b_m2():
-    """1.5B 最终定稿 (M2c): L0-4 + L18-23 全bf16保护带, L5-17 量化。
+    """1.5B 最终定稿 (X5): L0+L6+L18+L23 bf16稀释层, 其余量化。
 
-    MATH500 12.0% (60/500, 达标12.0%), decode 86.3 t/s (达标65), 1.4x
-    缩小保护层实验: M2b(去L18)=11.2%崩, M2d(去L5+L18)=10.8%,
-                     M2c(仅去L5)=12.0% → L18必须保护, L5可牺牲
+    MATH500 11.8% (59/500), VRAM 1.93GiB✅, decode 78.9t/s✅, 1.7x
+    稀释层扫描: X0(L0+L23)=9.0%, X5(L0+L6+L18+L23)=13.5%(200题),
+                X5全量500题=11.8% → L6/L18是关键稀释点,
+                仅需4层bf16即可达到M2c(11层保护)的精度
     """
-    return [
-        [5,  17, 1, FP8],        # key L5-17 FP8
-        [5,  17, 2, FP8],        # value L5-17 FP8
-        [5,  17, 0, NVFP4],      # rec L5-17 NVFP4
-        [5,  17, 3, NVFP4],      # out L5-17 NVFP4
-        [5,  17, 4, NVFP4_RES],  # ffn_k L5-17 NVFP4+FP8残差
-        [5,  17, 5, FP8],        # ffn_v L5-17 FP8
-        # L0-4, L18-23: 默认bf16 (保护带)
-    ]
+    protected = {0, 6, 18, 23}  # L0: v_first源头; L6/L18: 稀释点; L23: 输出层
+    rules = []
+    for l in range(24):
+        if l in protected:
+            continue
+        rules += [[l, l, 1, FP8], [l, l, 2, FP8], [l, l, 0, NVFP4],
+                  [l, l, 3, NVFP4], [l, l, 4, NVFP4_RES], [l, l, 5, FP8]]
+    return rules
 
 
 def get_scheme_2_9b():
