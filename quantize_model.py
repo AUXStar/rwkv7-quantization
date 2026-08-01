@@ -199,6 +199,23 @@ def get_scheme_1_5b():
     ]
 
 
+def get_scheme_1_5b_l0l23():
+    """1.5B + L0/L23全bf16保护带（中间22层按当前方案量化）。
+
+    依据: 归因实验 Step 3 — 交替方案(MATH500 0%)自回归崩溃;
+         保留L0(L0 state最不敏感, 但L0是v_first源头)和L23(输出前最后层)
+         作干净校准点, L1-22量化 → MATH500 11.4% (vs 全量化 11.2%)
+    """
+    return [
+        [1, 22, 1, FP8],
+        [1, 22, 2, FP8],
+        [1, 22, 0, NVFP4],
+        [1, 22, 3, NVFP4],
+        [1, 22, 4, NVFP4_RES],
+        [1, 22, 5, FP8],
+    ]
+
+
 def get_scheme_2_9b():
     """Scheme for 2.9B (32 layers), scaled from 1.5B findings."""
     return [
@@ -244,6 +261,7 @@ def get_scheme_fp8():
 
 SCHEMES = {
     "1.5b": get_scheme_1_5b,
+    "1.5b-l0l23": get_scheme_1_5b_l0l23,
     "2.9b": get_scheme_2_9b,
     "experimental": get_scheme_experimental,
     "fp8": get_scheme_fp8,
