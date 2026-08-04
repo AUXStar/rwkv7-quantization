@@ -717,7 +717,10 @@ def linear_quantized_fused(x, weight_info, out_dtype=torch.float16):
     from fp8_ops import linear_fp8
     qtype = weight_info.get("qtype", "fp8")
     M = x.numel() // x.size(-1)
-    if M <= FUSED_M_MAX:
+    # Per-channel scales: skip fused Triton path (only supports per-tensor),
+    # fall through to _scaled_mm which natively supports per-channel scale_b.
+    is_per_channel = weight_info["tensor_scale"].dim() > 0
+    if M <= FUSED_M_MAX and not is_per_channel:
         if qtype in ("fp8", "fp8_w8a16"):
             return linear_fp8_fused(x, weight_info, out_dtype)
     # Large M: _scaled_mm

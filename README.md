@@ -291,6 +291,45 @@ Yes. The inference engine auto-detects `.fp8_scale` keys in the model file and r
 
 ---
 
+## Research
+
+### EAR (Expected Acceptance Rate) Metric
+
+Based on [SLQ paper (arXiv:2605.02404)](https://arxiv.org/abs/2605.02404), we implemented the EAR metric to measure distribution-level quantization loss beyond simple Top-1 agreement.
+
+**FP8 quantization EAR = 0.94** (1.5B model): classified as "significant distribution shift" (below 0.95 threshold). While Top-1 agreement is 92.5%, the full probability distributions diverge more than Top-1 alone suggests.
+
+| Metric | Per-Tensor FP8 | Per-Channel FP8 |
+|--------|---------------|-----------------|
+| EAR | **0.9412** | 0.9262 |
+| Top-1 agreement | 92.52% | **95.33%** |
+| KL(orig∥quant) | **0.0201** | 0.0376 |
+
+### Per-Channel FP8 Quantization
+
+Based on [Weight Quantization Study (arXiv:2505.03803)](https://arxiv.org/abs/2505.03803), we tested per-output-channel FP8 scales.
+
+**Result**: Per-channel improves Top-1 (+2.8pp) but worsens distribution similarity (EAR -1.5pp, KL +87%). **Not recommended** — per-tensor remains optimal.
+
+### Weight Distribution Asymmetry
+
+Analysis of all 144 weight matrices (24 layers × 6 components) shows **perfectly symmetric distributions** (|skew| < 0.01, positive fraction ~50%). Asymmetric quantization provides zero benefit.
+
+### Experiment Files
+
+| File | Description |
+|------|-------------|
+| `experiments/eval_ear.py` | EAR evaluation script |
+| `experiments/analyze_weights.py` | Weight distribution asymmetry analysis |
+| `experiments/EXPERIMENT_REPORT.md` | Complete experiment report |
+
+### References
+
+1. SLQ: Simple Linear Quantization, [arXiv:2605.02404](https://arxiv.org/abs/2605.02404)
+2. A Weight Quantization Study, [arXiv:2505.03803](https://arxiv.org/abs/2505.03803)
+
+---
+
 ## Issues
 
 Discussions welcome in the [Issues](https://github.com/AUXStar/rwkv7-quantization/issues) section:

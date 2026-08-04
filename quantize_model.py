@@ -41,10 +41,11 @@ ATT_SUFFIXES = ("receptance.weight", "key.weight", "value.weight", "output.weigh
 def quantize_to_fp8(w, per_channel=False):
     """FP8 E4M3 quantization. per_channel=True -> per-column scale [N]."""
     if per_channel:
-        amax = w.abs().amax(dim=0)
+        # Per-output-channel: w is [N, K], scale is [N] (one per output channel)
+        amax = w.abs().amax(dim=1)
         scale = (amax / FP8_E4M3_MAX).float()
         scale = scale.clamp(min=1e-10)
-        w_fp8 = (w.float() / scale.unsqueeze(0)).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
+        w_fp8 = (w.float() / scale.unsqueeze(1)).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
         return w_fp8, scale
     amax = w.abs().max()
     scale = (amax / FP8_E4M3_MAX).float() if amax > 0 else torch.tensor(1.0, dtype=torch.float32)
@@ -116,7 +117,7 @@ def get_dtype_for(rules, layer, comp):
 # Main quantization pipeline
 # ============================================================================
 
-def quantize_model(model_path, output_path, scheme_name="fp8", device='cuda', _scheme_override=None):
+def quantize_model(model_path, output_path, scheme_name="fp8", device='cuda', _scheme_override=None, per_channel=False):
     """Quantize a model according to the specified scheme."""
     print(f"Loading model: {model_path}", flush=True)
     z = torch.load(model_path, map_location="cpu", mmap=True)
@@ -135,7 +136,7 @@ def quantize_model(model_path, output_path, scheme_name="fp8", device='cuda', _s
             return
         rules = scheme_fn()
 
-    print(f"\nQuantization scheme: {scheme_name}", flush=True)
+    print(f"\nQuantization scheme: {scheme_name} (per_channel={per_channel})", flush=True)
     print(f"{'Layer':<8} {'key':<12} {'value':<12} {'rec':<12} {'out':<12} {'ffn_k':<14} {'ffn_v':<12}", flush=True)
     for layer in range(num_layers):
         dtypes = {}
@@ -171,7 +172,7 @@ def quantize_model(model_path, output_path, scheme_name="fp8", device='cuda', _s
             continue
 
         if dtype == FP8:
-            w_fp8, scale = quantize_to_fp8(w)
+            w_fp8, scale = quantize_to_fp8(w, per_channel=per_channel)
             z[key] = w_fp8.contiguous()
             z[key + ".fp8_scale"] = scale.contiguous()
             stats["fp8"] += 1
@@ -193,6 +194,7 @@ def quantize_model(model_path, output_path, scheme_name="fp8", device='cuda', _s
         "layers": num_layers,
         "r": rules,
         "s": {"sd": "fp8e4m3", "td": "fp32"},
+        "pc": per_channel,
         "n": non_quant_prefixes,
         "stats": stats,
         "orig_size_gb": total_orig / 2**30,
@@ -227,9 +229,10 @@ def main():
     parser.add_argument("--scheme", default="fp8", choices=list(SCHEMES.keys()),
                         help="Quantization scheme (default: fp8)")
     parser.add_argument("--device", default="cuda", help="Device for quantization")
+    parser.add_argument("--per-channel", action="store_true", help="Use per-channel (per-column) FP8 scales")
     args = parser.parse_args()
 
-    quantize_model(args.model, args.output, args.scheme, args.device)
+    quantize_model(args.model, args.output, args.scheme, args.device, per_channel=args.per_channel)
 
 
 if __name__ == "__main__":

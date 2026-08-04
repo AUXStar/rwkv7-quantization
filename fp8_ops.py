@@ -24,7 +24,7 @@ def is_fp8_weight(z, key):
 # ============================================================================
 
 def load_fp8_weight(z, key, dev, w8a16=False):
-    """Load FP8 weight: float8_e4m3fn + per-tensor scale.
+    """Load FP8 weight: float8_e4m3fn + scale (per-tensor or per-channel).
 
     Args:
         z: weight dict
@@ -34,10 +34,11 @@ def load_fp8_weight(z, key, dev, w8a16=False):
                if False, use W8A8 path (both weight and activation quantized).
 
     Removes the .fp8_scale key from z.
-    Returns a dict with weight, tensor_scale (scalar), qtype.
+    Returns a dict with weight, tensor_scale, qtype.
+    Scale is scalar (per-tensor) or [N] tensor (per-channel).
     """
     w = z[key].to(device=dev).contiguous()            # [N, K] float8_e4m3fn
-    scale = z[key + ".fp8_scale"].to(device=dev)      # scalar float32
+    scale = z[key + ".fp8_scale"].to(device=dev)      # scalar or [N] float32
     del z[key + ".fp8_scale"]
     return {
         "weight": w,
@@ -55,6 +56,8 @@ FP8_E4M3_MAX = 448.0
 def linear_fp8(x, weight_info, out_dtype=torch.float16):
     """FP8 GEMM: quantize input on-the-fly to FP8, use torch._scaled_mm.
 
+    Supports both per-tensor (scalar scale) and per-channel ([N] scale).
+
     Args:
         x: [B, T, K] or [M, K] fp16/bf16 input
         weight_info: dict from load_fp8_weight
@@ -64,7 +67,7 @@ def linear_fp8(x, weight_info, out_dtype=torch.float16):
         [B, T, N] or [M, N] in out_dtype
     """
     w = weight_info["weight"]              # [N, K] float8_e4m3fn
-    w_scale = weight_info["tensor_scale"]  # scalar float32
+    w_scale = weight_info["tensor_scale"]  # scalar or [N] float32
 
     orig_shape = x.shape
     x_2d = x.reshape(-1, orig_shape[-1]).contiguous()
@@ -80,9 +83,21 @@ def linear_fp8(x, weight_info, out_dtype=torch.float16):
 
     x_fp8 = (x_2d.float() / x_scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
 
+    # Handle per-tensor (scalar) vs per-channel ([N]) weight scale
+    # _scaled_mm RowWise mode requires scale_a=(M,1) and scale_b=(1,N)
+    M = x_2d.size(0)
+    if w_scale.dim() == 0:
+        # Per-tensor: both scales are singletons (TensorWise mode)
+        scale_a = x_scale.reshape(1)
+        scale_b = w_scale.reshape(1)
+    else:
+        # Per-channel: RowWise mode, scale_a=(M,1), scale_b=(1,N)
+        scale_a = x_scale.reshape(1).expand(M, 1).contiguous()
+        scale_b = w_scale.reshape(1, -1).contiguous()
+
     out = torch._scaled_mm(x_fp8, w.t(),
-        scale_a=x_scale.reshape(1),
-        scale_b=w_scale.reshape(1),
+        scale_a=scale_a,
+        scale_b=scale_b,
         out_dtype=torch.bfloat16)
 
     N = w.size(0)
@@ -110,7 +125,8 @@ def linear_fp8_w8a16(x, weight_info, out_dtype=torch.float16):
     w_scale = weight_info["tensor_scale"]  # scalar float32
 
     # Dequantize weight: FP8 -> FP16, then multiply by scale
-    w_fp16 = w.to(torch.float16) * w_scale.to(torch.float16)
+    # Per-channel: w_scale is [N], broadcast over [N, K]
+    w_fp16 = w.to(torch.float16) * w_scale.to(torch.float16).unsqueeze(-1) if w_scale.dim() > 0 else w.to(torch.float16) * w_scale.to(torch.float16)
 
     # Reshape input
     orig_shape = x.shape
