@@ -6,6 +6,7 @@ try:
     from rich.console import Console
     from rich.table import Table
     from rich.panel import Panel
+    from rich.progress import Progress, BarColumn, TextColumn, SpinnerColumn, TimeElapsedColumn
     from rich import box
     _r=Console();_RICH=True
 except ImportError:
@@ -17,11 +18,12 @@ SELF=str(Path(__file__).parent)
 
 SCHEMES={"fp8":dict(n="FP8 E4M3",b=8,a=8,c=2.0,hw="SM>=8.9"),"fp8_perchannel":dict(n="FP8 Per-Channel",b=8,a=8,c=2.0,hw="SM>=8.9"),"int8_symmetric":dict(n="INT8 Symmetric",b=8,a=8,c=2.0,hw="Any CUDA"),"int8_affine":dict(n="INT8 Affine",b=8,a=8,c=2.0,hw="Any CUDA"),"int4_symmetric":dict(n="INT4 Symmetric",b=4,a=16,c=4.0,hw="Any CUDA"),"int4_groupwise_128":dict(n="INT4 Group g=128",b=4,a=16,c=3.5,hw="Any CUDA"),"int4_groupwise_256":dict(n="INT4 Group g=256",b=4,a=16,c=3.7,hw="Any CUDA")}
 
-R="\033[0m";B="\033[1m";CY="\033[36M";GN="\033[32M";RD="\033[31M"
+R="\033[0M";BD="\033[1M";CY="\033[36M";GN="\033[32M";YL="\033[33M";RD="\033[31M";DM="\033[2M";MG="\033[35M"
 def C(t,c):return f"{c}{t}{R}" if sys.stdout.isatty() else str(t)
-def hd(t): return C(t,B+CY)
+def hd(t): return C(t,BD+CY)
 def ok(t): return C(t,GN)
 def er(t): return C(t,RD)
+def dm(t): return C(t,DM)
 def hs(n):
     for u in("B","KB","MB","GB","TB"):
         if abs(n)<1024:return f"{n:.1f}{u}"
@@ -146,16 +148,60 @@ def cmd_quantize(args):
     print(f"  Loading: {p}...");t0=time.time()
     z=torch.load(p,map_location="cpu",weights_only=True)
     nl=max((int(k.split(".")[1]) for k in z if k.startswith("blocks.") and len(k.split("."))>=2),default=0)+1
-    print(f"  {nl} layers, {len(z)} keys")
-    qc=0
-    for k in list(z.keys()):
-        if clsf(k,nl) is None:continue
-        w=z[k].float();z[k]=qfn(w,**qkw);qc+=1
+    # Collect quantizable keys
+    keys_to_q = [(k, clsf(k, nl)) for k in z if clsf(k, nl) is not None]
+    total = len(keys_to_q)
+    print(f"  {nl} layers, {total} quantizable weights, {len(z)} total keys\n")
+
+    # Quantize with progress
+    if _RICH:
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), BarColumn(), TextColumn("{task.completed}/{task.total}"), TimeElapsedColumn(), console=_r) as prog:
+            task = prog.add_task(f"  Quantizing [{sch['name']}]", total=total)
+            qc = 0
+            for k, info in keys_to_q:
+                w = z[k].float()
+                z[k] = qfn(w, **qkw)
+                qc += 1
+                prog.advance(task)
+        print()
+    else:
+        qc = 0
+        for i, (k, info) in enumerate(keys_to_q):
+            w = z[k].float()
+            z[k] = qfn(w, **qkw)
+            qc += 1
+            if (i+1) % 24 == 0 or i+1 == total:
+                pct = (i+1)/total*100
+                bar = chr(9608) * int(pct/5) + chr(9617) * (20 - int(pct/5))
+                print(f"\r  {bar} {pct:5.1f}% ({i+1}/{total})", end="", flush=True)
+        print()
+
+    # Save
     z["quant_meta"]={"scheme":s,"format":sch["format"],"ts":time.strftime("%Y-%m-%d %H:%M:%S")}
-    os.makedirs(os.path.dirname(o) or ".",exist_ok=True);torch.save(z,o)
+    os.makedirs(os.path.dirname(o) or ".",exist_ok=True)
+    print(f"  Saving to {o}...", end=" ", flush=True)
+    torch.save(z,o)
+    print("done")
+
+    # Summary box
     sz=os.path.getsize(o);orig=os.path.getsize(p);dt=time.time()-t0
-    print(f"  {ok(f"Done: {qc} weights")} in {dt:.1f}s")
-    print(f"  {hs(orig)} -> {hs(sz)} ({orig/max(sz,1):.2f}x)")
+    print()
+    print(f"  {hd('Quantization Complete')}")
+    print(f"  {dm(chr(8722)*44)}")
+    print(f"  {C('Scheme:',BD)}      {sch['name']}")
+    print(f"  {C('Format:',BD)}      {sch['format']}")
+    print(f"  {C('Weights:',BD)}     {qc:,} / {total} (6 per layer)")
+    print(f"  {C('Layers:',BD)}      {nl}")
+    print(f"  {C('Time:',BD)}        {dt:.1f}s ({qc/dt:.0f} weights/s)")
+    print(f"  {dm(chr(8722)*44)}")
+    ratio = orig/max(sz,1)
+    sav = (1 - sz/max(orig,1)) * 100
+    orig_h = hs(orig); sz_h = hs(sz)
+    if ratio > 1:
+        print(f"  {C('Size:',BD)}        {orig_h} {C('->',DM)} {C(sz_h,GN)} ({C(f'{ratio:.2f}x',GN)}, save {C(f'{sav:.0f}%',GN)})")
+    else:
+        print(f"  {C('Size:',BD)}        {orig_h} {C('->',DM)} {C(sz_h,YL)} ({C(f'{ratio:.2f}x',YL)})")
+    print(f"  {dm(chr(8722)*44)}")
     return 0
 
 def cmd_compare(args):
@@ -224,31 +270,35 @@ def cmd_sensitivity(args):
     rt("Component Statistics",cols,rows)
     return 0
 def main():
-    ap=argparse.ArgumentParser(prog="rqkv",description="RWKV-7 Quantization Toolkit",
+    ap=argparse.ArgumentParser(prog="rwkv-quant",description="RWKV-7 Quantization Toolkit",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n  rqkv info -m model.pth\n  rqkv list\n  rqkv quantize -m model.pth -o q.pth -s fp8\n  rqkv compare -m model.pth\n  rqkv eval -b orig.pth -q q.pth\n  rqkv sensitivity -m model.pth")
     sp=ap.add_subparsers(dest="cmd",help="command")
     # info
-    s=sp.add_parser("info",help="Show model info");s.add_argument("-m","--model",required=True)
+    s=sp.add_parser("info",help="Show model info [aliases: i, info]");s.add_argument("-m","--model",required=True)
     # list
-    sp.add_parser("list",help="List quantization schemes")
+    sp.add_parser("list",help="List quantization schemes [aliases: l, li]")
     # quantize
-    s=sp.add_parser("quantize",help="Quantize a model")
+    s=sp.add_parser("quantize",help="Quantize a model [aliases: q, quant]")
     s.add_argument("-m","--model",required=True);s.add_argument("-o","--output",required=True)
     s.add_argument("-s","--scheme",default="fp8")
     # compare
-    s=sp.add_parser("compare",help="Compare all schemes")
+    s=sp.add_parser("compare",help="Compare all schemes [aliases: c, cmp]")
     s.add_argument("-m","--model",required=True);s.add_argument("-C","--outdir",default=None)
     # eval
-    s=sp.add_parser("eval",help="Evaluate quantized model")
+    s=sp.add_parser("eval",help="Evaluate quantized model [aliases: e, eval]")
     s.add_argument("-b","--baseline",required=True);s.add_argument("-q","--quantized",required=True)
     # sensitivity
-    s=sp.add_parser("sensitivity",help="Per-tensor sensitivity analysis")
+    s=sp.add_parser("sensitivity",help="Per-tensor sensitivity [aliases: s, sens]")
     s.add_argument("-m","--model",required=True)
 
+    ABBREV = {"l":"list","li":"list","i":"info","q":"quantize","quant":"quantize","c":"compare","cmp":"compare","e":"eval","s":"sensitivity","sens":"sensitivity"}
+    if sys.argv[1:] and sys.argv[1] in ABBREV:
+        sys.argv[1] = ABBREV[sys.argv[1]]
     args=ap.parse_args()
     if not args.cmd:ap.print_help();return 0
     CMDS={"info":cmd_info,"list":cmd_list,"quantize":cmd_quantize,"compare":cmd_compare,"eval":cmd_eval,"sensitivity":cmd_sensitivity}
+    if args.cmd not in CMDS:print(f"Unknown: {args.cmd}");return 1
     return CMDS[args.cmd](args)
 
 if __name__=="__main__":raise SystemExit(main())
