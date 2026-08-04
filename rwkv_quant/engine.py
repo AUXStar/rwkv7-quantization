@@ -114,10 +114,10 @@ def measure_speed(model_path: str, warmup: int = 3, steps: int = 20) -> float:
     t0 = time.time()
     state = model.zero_state(1)
     with torch.no_grad():
-        model.forward(inp, state)
+        logits = model.forward(inp, state)
         for _ in range(steps):
-            nxt = torch.argmax(state[-1][-1]).unsqueeze(0).unsqueeze(0)
-            model.forward(nxt, state)
+            nxt = torch.argmax(logits[0, -1]).unsqueeze(0).unsqueeze(0)
+            logits = model.forward(nxt, state)
     torch.cuda.synchronize()
     elapsed = time.time() - t0
 
