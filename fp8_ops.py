@@ -24,21 +24,24 @@ def is_fp8_weight(z, key):
 # ============================================================================
 
 def load_fp8_weight(z, key, dev):
-    """Load FP8 weight: float8_e4m3fn + per-tensor scale (W8A8, 禁止反量化).
+    """Load quantized weight: FP8 or INT8 + per-tensor scale.
 
-    FP8 权重只允许保持 FP8 域，由 FP8 张量核（_scaled_mm / tl.dot(fp8,fp8)）计算，
+    FP8 权重保持 FP8 域，由 FP8 张量核（_scaled_mm / tl.dot(fp8,fp8)）计算，
     绝不反量化回 fp16/bf16 再 GEMM。
+
+    INT8 权重无硬件张量核加速，反量化回 fp16 后用普通 GEMM（仅此例外）。
 
     Removes the .fp8_scale key from z.
     Returns a dict with weight, tensor_scale (scalar), qtype.
     """
-    w = z[key].to(device=dev).contiguous()            # [N, K] float8_e4m3fn
+    w = z[key].to(device=dev).contiguous()
     scale = z[key + ".fp8_scale"].to(device=dev)      # scalar float32
     del z[key + ".fp8_scale"]
+    qtype = "fp8" if w.dtype == torch.float8_e4m3fn else "int8"
     return {
         "weight": w,
         "tensor_scale": scale,
-        "qtype": "fp8",  # 固定 W8A8 真量化域，禁止 w8a16 反量化
+        "qtype": qtype,
     }
 
 
@@ -89,9 +92,33 @@ def linear_fp8(x, weight_info, out_dtype=torch.float16):
 
 
 
+def linear_int8(x, weight_info, out_dtype=torch.float16):
+    """INT8 GEMM: dequantize weight to fp16, then normal matmul.
+
+    INT8 无硬件张量核加速（has_hardware_accel=False），反量化是预期行为。
+    与 FP8 不同：FP8 有张量核 → 禁止反量化；INT8 无张量核 → 必须反量化。
+    """
+    w = weight_info["weight"]              # [N, K] int8
+    w_scale = weight_info["tensor_scale"]  # scalar float32
+    w_fp16 = w.to(torch.float32) * w_scale  # dequantize
+    if w_fp16.dtype != out_dtype:
+        w_fp16 = w_fp16.to(out_dtype)
+    orig_shape = x.shape
+    x_2d = x.reshape(-1, orig_shape[-1])
+    if x_2d.dtype != out_dtype:
+        x_2d = x_2d.to(out_dtype)
+    out = x_2d @ w_fp16.t()
+    N = w.size(0)
+    out = out.reshape(*orig_shape[:-1], N)
+    return out
+
+
 def linear_quantized(x, weight_info, out_dtype=torch.float16):
     """Dispatcher: pick the right GEMM based on qtype in weight_info."""
-    # 禁止反量化：FP8 权重永远走 FP8 张量核（_scaled_mm），保持 FP8 域
+    qtype = weight_info.get("qtype", "fp8")
+    if qtype == "int8":
+        return linear_int8(x, weight_info, out_dtype)
+    # FP8 权重永远走 FP8 张量核（_scaled_mm），保持 FP8 域，禁止反量化
     return linear_fp8(x, weight_info, out_dtype)
 
 

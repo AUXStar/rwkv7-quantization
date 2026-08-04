@@ -29,15 +29,15 @@ SCHEMES = {
         n="FP8 E4M3", b=8, a=8, c=2.0, hw="SM>=8.9", col="green",
         fmt="float8+scale", group="true",
         use="新卡(RTX 40/50系·H100·SM≥8.9)省显存/省磁盘：首选",
-        score=4.0,
-        desc="Per-tensor FP8：权重直接存为 float8（1字节）+1个全局scale，推理时乘回。文件约0.57x，精度高。",
+        score=4.5,
+        desc="Per-tensor FP8：权重直接存为 float8（1字节）+1个全局scale，推理走FP8张量核，禁止反量化。文件约0.57x，精度高。",
     ),
     "fp8_perchannel": dict(
         n="FP8 Per-Channel", b=8, a=8, c=2.0, hw="SM>=8.9", col="green",
         fmt="float8+[N]scale", group="true",
         use="新卡·对精度敏感的任务（代码/数学）",
-        score=4.0,
-        desc="每输出通道独立scale，对离群通道更鲁棒，精度略优于per-tensor。文件约0.57x。",
+        score=4.5,
+        desc="每输出通道独立scale，对离群通道更鲁棒，精度略优于per-tensor。推理走FP8张量核。文件约0.57x。",
     ),
     "int8_symmetric": dict(
         n="INT8 Symmetric", b=8, a=8, c=2.0, hw="Any CUDA", col="cyan",
@@ -95,8 +95,9 @@ LIST_FOOTNOTE = (
     "说明：\"模拟量化\" = 先按低比特规则量化、再立即反量化回浮点权重（仍存bf16，文件不变），"
     "在实现真正的压缩打包+推理加速前先估算精度损失。\n"
     "评分 = 加权平均（压缩35% / 精度30% / 兼容20% / 速度15%），满分5.0。"
-    "当前 FP8/int8 的推理实现是\"反量化回 fp16 再算\"（decode 速度约 0.59x，未用上低比特张量核），"
-    "故速度维度均低分；int4_* 因未实现压缩存储，综合分低。"
+    "FP8 推理走 FP8 张量核（_scaled_mm / Triton tl.dot），禁止反量化，速度与精度兼优；"
+    "INT8 无硬件张量核，推理时反量化回 fp16 再算，速度略慢但兼容所有 CUDA GPU；"
+    "int4_* 因未实现压缩存储，综合分低。"
 )
 
 

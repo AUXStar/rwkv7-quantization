@@ -673,7 +673,7 @@ class RWKV7:
         if self.fp8_keys:
             global CMIX_SPARSE
             CMIX_SPARSE = "off"
-            log(f"Quantized weights: {len(self.fp8_keys)} FP8, forcing CMIX_SPARSE=off")
+            log(f"Quantized weights: {len(self.fp8_keys)} (FP8/INT8), forcing CMIX_SPARSE=off")
 
         H, N = z["blocks.0.att.r_k"].shape
         C, V = H * N, z["emb.weight"].shape[0]

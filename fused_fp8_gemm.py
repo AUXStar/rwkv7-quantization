@@ -709,17 +709,20 @@ def linear_fp8_fused(x, weight_info_or_w, res_scale=None, out_dtype=torch.float1
 
 
 def linear_quantized_fused(x, weight_info, out_dtype=torch.float16):
-    """FP8 quantized GEMM dispatcher (used by the engine).
+    """Quantized GEMM dispatcher (used by the engine).
 
-    - M <= FUSED_M_MAX (decode/small batch): fused single-kernel GEMM (with CUDA Graph).
-    - M > FUSED_M_MAX (prefill/large batch): _scaled_mm path (cuBLAS wins for large M).
+    - INT8: 无硬件张量核，走 linear_quantized（反量化 fp16 GEMM）。
+    - FP8 M <= FUSED_M_MAX: fused single-kernel GEMM (with CUDA Graph).
+    - FP8 M > FUSED_M_MAX: _scaled_mm path (cuBLAS wins for large M).
     """
-    from fp8_ops import linear_fp8
+    from fp8_ops import linear_fp8, linear_quantized
     qtype = weight_info.get("qtype", "fp8")
+    # INT8 无融合内核，走通用 dispatcher（内部反量化）
+    if qtype == "int8":
+        return linear_quantized(x, weight_info, out_dtype)
     M = x.numel() // x.size(-1)
     if M <= FUSED_M_MAX:
-        if qtype == "fp8":  # 只存在 W8A8 真量化域，无 w8a16
-            return linear_fp8_fused(x, weight_info, out_dtype)
+        return linear_fp8_fused(x, weight_info, out_dtype)
     # Large M: _scaled_mm（FP8 张量核，保持 FP8 域，禁止反量化）
     return linear_fp8(x, weight_info, out_dtype)
 
