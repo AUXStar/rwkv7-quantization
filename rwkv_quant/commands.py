@@ -1,5 +1,9 @@
 # coding=utf-8
-"""rwkv-quant 的 6 个子命令实现。"""
+"""rwkv-quant 的 6 个子命令实现。
+
+性能关键点：torch / engine / evaluate 全部懒加载（在函数内 import），
+让 `list`、`info` 等轻量命令避开 torch 的 CUDA 预加载开销。
+"""
 
 from __future__ import annotations
 
@@ -10,12 +14,8 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-import torch
-
-from . import engine as eng
-from .evaluate import PROMPTS, compute_metrics
-from .schemes import SCHEMES, classify, load_state
-from .utils import ROOT, hs, err_exit, C, hd, ok, wr, er, dm, mg, BD
+from .schemes import SCHEMES, classify, load_state, compact_state
+from .utils import ROOT, hs, err_exit, C, hd, ok, dm, BD, wr
 
 try:  # rich 可选：提供更漂亮的表格/进度条
     from rich.console import Console
@@ -29,14 +29,39 @@ except ImportError:
 
 
 def _scheme_quantizer(name: str):
-    """加载指定方案的量化函数。"""
+    """加载指定方案的量化函数（根目录 schemes.py 实现）。"""
     sys.path.insert(0, ROOT)
-    from schemes import get_scheme  # 根目录 schemes.py（已有量化实现）
+    from schemes import get_scheme
     return get_scheme(name)
 
 
+def _lazy_torch():
+    """按需加载 torch，加载前先提示（torch 首次导入较慢）。"""
+    print(f"  {dm('Loading torch (first time may take a while)...')}", end="", flush=True)
+    import torch
+    print(ok("done"))
+    return torch
+
+
+def _store_quantized(state: dict, key: str, result, orig_dtype):
+    """把量化结果按约定格式写入 state。
+
+    schemes.py 的 quantize 返回两种形态：
+      - (w_q, scale) 元组：FP8/INT8 量化 → 权重单独存为 key，
+        scale 存为 key + ".fp8_scale"，与 fp8_ops.load_fp8_weight 兼容；
+      - 近似权重张量：INT4 等返回重建后的权重 → 直接存 key，
+        并转回原始 dtype（如 bf16），避免近似权重膨胀成 float32。
+    返回应写入 state[key] 的张量。
+    """
+    if isinstance(result, tuple):
+        w_q, scale = result
+        state[key + ".fp8_scale"] = scale
+        return w_q
+    return result.to(orig_dtype)
+
+
 # ─────────────────────────────────────────────────────────────
-#  list —— 列出所有量化方案
+#  list —— 列出所有量化方案（不依赖 torch，保持秒开）
 # ─────────────────────────────────────────────────────────────
 def cmd_list(args) -> int:
     if RICH:
@@ -45,19 +70,21 @@ def cmd_list(args) -> int:
         table.add_column("Scheme", style="bold")
         table.add_column("Bits", justify="center")
         table.add_column("Act", justify="center")
-        table.add_column("Compression", justify="center")
-        table.add_column("HW Requirement", justify="center")
+        table.add_column("Comp", justify="center")
+        table.add_column("HW", justify="center")
+        table.add_column("Description")
         for name, s in SCHEMES.items():
             table.add_row(f"[{s['col']}]{name}[/]", f"{s['b']}W", f"{s['a']}A",
-                          f"[{s['col']}]{s['c']:.1f}x[/]", f"[yellow]{s['hw']}[/]")
+                          f"[{s['col']}]{s['c']:.1f}x[/]", f"[yellow]{s['hw']}[/]",
+                          f"[{s['col']}]{s['desc']}[/]")
         _r.print(table)
     else:
         print(f"\n{hd('✦ Quantization Schemes ✦')}")
-        print(f"  {dm('─' * 60)}")
-        print(f"  {'Scheme':20s} {'Bits':>5s} {'Act':>4s} {'Comp':>7s} {'HW Req':>12s}")
+        print(f"  {dm('─' * 90)}")
         for name, s in SCHEMES.items():
-            print(f"  {ok(name):20s} {s['b']:>3d}W {s['a']:>3d}A {s['c']:>6.1f}x {s['hw']:>12s}")
-        print(f"  {dm('─' * 60)}")
+            print(f"  {ok(name):22s} {s['b']}W{s['a']}A {s['c']:4.1f}x  {s['hw']:>9s}")
+            print(f"  {dm(' ' * 22 + '↳ ')}{s['desc']}")
+        print(f"  {dm('─' * 90)}")
     return 0
 
 
@@ -71,7 +98,9 @@ def cmd_info(args) -> int:
 
     print(f"  {dm('Loading model...')}")
     t0 = time.time()
+    print(f"  {dm('Loading torch (first time may take a while)...')}", end="", flush=True)
     state, num_layers = load_state(path)
+    print(ok("done"))
     load_time = time.time() - t0
 
     w0 = state.get("blocks.0.att.receptance.weight")
@@ -115,6 +144,8 @@ def cmd_info(args) -> int:
 #  quantize —— 量化模型
 # ─────────────────────────────────────────────────────────────
 def cmd_quantize(args) -> int:
+    torch = _lazy_torch()
+
     model_path, output, scheme = args.model, args.output, args.scheme
     if not model_path:
         err_exit("-m/--model is required (quantize what?)")
@@ -151,15 +182,15 @@ def cmd_quantize(args) -> int:
             task = prog.add_task(f"[{SCHEMES[scheme]['col']}]Quantizing {scheme}", total=total)
             done = 0
             for key, _info in targets:
-                weight = state[key].float()
-                state[key] = qfn(weight, **qkw)
+                orig = state[key]
+                state[key] = _store_quantized(state, key, qfn(orig.float(), **qkw), orig.dtype)
                 done += 1
                 prog.advance(task)
     else:
         done = 0
         for i, (key, _info) in enumerate(targets):
-            weight = state[key].float()
-            state[key] = qfn(weight, **qkw)
+            orig = state[key]
+            state[key] = _store_quantized(state, key, qfn(orig.float(), **qkw), orig.dtype)
             done += 1
             if (i + 1) % 24 == 0 or i + 1 == total:
                 pct = (i + 1) / total * 100
@@ -167,14 +198,14 @@ def cmd_quantize(args) -> int:
                 print(f"\r  {bar} {ok(f'{pct:5.1f}%')} ({i + 1}/{total})", end="", flush=True)
         print()
 
-    # 保存
+    # 保存（先打破共享 storage，避免文件膨胀）
     state["quant_meta"] = {
         "scheme": scheme,
         "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
     print(f"  {dm('Saving')} → {output} ...", end=" ", flush=True)
-    torch.save(state, output)
+    torch.save(compact_state(state), output)
     print(ok("done"))
 
     elapsed = time.time() - t0
@@ -200,6 +231,8 @@ def cmd_quantize(args) -> int:
 #  compare —— 对比所有方案的文件大小
 # ─────────────────────────────────────────────────────────────
 def cmd_compare(args) -> int:
+    torch = _lazy_torch()
+
     model_path = args.model
     if not model_path:
         err_exit("-m/--model is required")
@@ -211,23 +244,24 @@ def cmd_compare(args) -> int:
     print(f"  {dm('Source:')} {model_path} ({hs(orig_size)})")
     print(f"  {dm('Output:')} {outdir}\n")
 
-    state, num_layers = load_state(model_path)
     results = []
 
     for name in SCHEMES:
+        # 每轮独立加载，控制内存峰值（避免 clone 整个模型翻倍）
+        state, num_layers = load_state(model_path)
         quantizer = _scheme_quantizer(name)
         qfn = quantizer["quantize"]
         qkw = dict(quantizer.get("quantize_kwargs", {}))
 
-        work = {k: (v.clone() if hasattr(v, "clone") else v) for k, v in state.items()}
-        for key in list(work.keys()):
+        for key in list(state.keys()):
             if classify(key, num_layers) is None:
                 continue
-            work[key] = qfn(work[key].float(), **qkw)
+            orig = state[key]
+            state[key] = _store_quantized(state, key, qfn(orig.float(), **qkw), orig.dtype)
 
         out = os.path.join(outdir, f"model_{name}.pth")
-        torch.save(work, out)
-        del work
+        torch.save(compact_state(state), out)
+        del state
         gc.collect()
 
         size = os.path.getsize(out)
@@ -256,6 +290,11 @@ def cmd_compare(args) -> int:
 #  eval —— EAR / Top-1 / 速度评估
 # ─────────────────────────────────────────────────────────────
 def cmd_eval(args) -> int:
+    print(f"  {dm('Loading torch (first time may take a while)...')}", end="", flush=True)
+    from . import engine as eng
+    from .evaluate import PROMPTS, compute_metrics
+    print(ok("done"))
+
     baseline, quantized = args.baseline, args.quantized
     if not baseline or not quantized:
         err_exit("-b/--baseline and -q/--quantized are required")
@@ -285,6 +324,8 @@ def cmd_eval(args) -> int:
 #  sensitivity —— 逐组件统计
 # ─────────────────────────────────────────────────────────────
 def cmd_sensitivity(args) -> int:
+    torch = _lazy_torch()
+
     model_path = args.model
     if not model_path:
         err_exit("-m/--model is required")

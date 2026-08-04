@@ -1,25 +1,47 @@
 # coding=utf-8
-"""量化方案注册表 + 权重分类 + 模型状态加载。"""
+"""量化方案注册表 + 权重分类 + 模型状态加载。
+
+注意：torch 只在 load_state 内导入（懒加载），
+让 SCHEMES / classify 可以被 list 等轻量命令直接使用。
+"""
 
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
-import torch
-
-from .utils import ROOT
-
 # ── 量化方案注册表 ────────────────────────────────────────────
-# b: 权重位宽  a: 激活位宽  c: 理论压缩比  hw: 硬件要求  col: 表格颜色
+# b: 权重位宽  a: 激活位宽  c: 理论压缩比  hw: 硬件要求
+# col: 表格颜色  desc: 方案说明（list 展示用）
+# 说明：fp8/int8_symmetric 为"真量化"（保存 fp8/int8 权重 + scale，文件变小）；
+#       int8_affine / int4_* 目前返回反量化后的近似权重（仍为 bf16），
+#       文件大小不缩，主要用作精度对比。
 SCHEMES = {
-    "fp8":                dict(n="FP8 E4M3",             b=8, a=8,  c=2.0, hw="SM>=8.9",  col="green"),
-    "fp8_perchannel":     dict(n="FP8 Per-Channel",      b=8, a=8,  c=2.0, hw="SM>=8.9",  col="green"),
-    "int8_symmetric":     dict(n="INT8 Symmetric",       b=8, a=8,  c=2.0, hw="Any CUDA", col="cyan"),
-    "int8_affine":        dict(n="INT8 Affine (MM8)",    b=8, a=8,  c=2.0, hw="Any CUDA", col="cyan"),
-    "int4_symmetric":     dict(n="INT4 Symmetric",       b=4, a=16, c=4.0, hw="Any CUDA", col="red"),
-    "int4_groupwise_128": dict(n="INT4 Group g=128",     b=4, a=16, c=3.5, hw="Any CUDA", col="red"),
-    "int4_groupwise_256": dict(n="INT4 Group g=256",     b=4, a=16, c=3.7, hw="Any CUDA", col="red"),
+    "fp8": dict(
+        n="FP8 E4M3", b=8, a=8, c=2.0, hw="SM>=8.9", col="green",
+        desc="Per-tensor FP8：1字节权重+1个scale，精度高，需Ada/Hopper/Blackwell加速",
+    ),
+    "fp8_perchannel": dict(
+        n="FP8 Per-Channel", b=8, a=8, c=2.0, hw="SM>=8.9", col="green",
+        desc="逐输出通道独立scale，对离群通道更鲁棒，精度略优",
+    ),
+    "int8_symmetric": dict(
+        n="INT8 Symmetric", b=8, a=8, c=2.0, hw="Any CUDA", col="cyan",
+        desc="对称INT8：1字节权重+1个scale，通用GPU可跑，精度良好",
+    ),
+    "int8_affine": dict(
+        n="INT8 Affine (MM8)", b=8, a=8, c=2.0, hw="Any CUDA", col="cyan",
+        desc="非对称INT8：行/列双偏移+双scale，精度更高（输出为近似权重）",
+    ),
+    "int4_symmetric": dict(
+        n="INT4 Symmetric", b=4, a=16, c=4.0, hw="Any CUDA", col="red",
+        desc="对称INT4：理论4x压缩，精度损失大（输出为近似权重）",
+    ),
+    "int4_groupwise_128": dict(
+        n="INT4 Group g=128", b=4, a=16, c=3.5, hw="Any CUDA", col="red",
+        desc="每128通道一组量化，组内独立scale/zero，精度优于per-tensor",
+    ),
+    "int4_groupwise_256": dict(
+        n="INT4 Group g=256", b=4, a=16, c=3.7, hw="Any CUDA", col="red",
+        desc="每256通道一组量化，压缩比略高，精度稍低",
+    ),
 }
 
 
@@ -49,8 +71,14 @@ def classify(key: str, num_layers: int):
 
 
 def load_state(model_path: str):
-    """加载模型状态字典，返回 (state_dict, num_layers)。"""
-    state = torch.load(model_path, map_location="cpu", weights_only=True)
+    """加载模型状态字典，返回 (state_dict, num_layers)。
+
+    使用 mmap 懒加载：张量按需从磁盘读入，内存占用小，
+    可处理超过物理内存的大模型（compare 对 2.9B 模型尤其重要）。
+    """
+    import torch
+
+    state = torch.load(model_path, map_location="cpu", weights_only=True, mmap=True)
     num_layers = max(
         (int(k.split(".")[1]) for k in state if k.startswith("blocks.") and len(k.split(".")) >= 2),
         default=0,
@@ -58,7 +86,12 @@ def load_state(model_path: str):
     return state, num_layers
 
 
-def num_model_layers(model_path: str) -> int:
-    """只统计层数（轻量）。"""
-    _, num_layers = load_state(model_path)
-    return num_layers
+def compact_state(state: dict) -> dict:
+    """打破张量间的共享 storage，返回新的独立存储 dict。
+
+    原因：RWKV 的 .pth 把所有张量打包进少数几个连续 storage（共享偏移）。
+    量化替换部分权重后，原 storage 整块仍被其余张量引用，torch.save
+    必须完整保留原数据，再追加新存储，导致文件膨胀。
+    clone 后每个张量独占 storage，文件大小 = 实际数据量。
+    """
+    return {k: (v.clone() if hasattr(v, "clone") else v) for k, v in state.items()}

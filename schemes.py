@@ -38,7 +38,7 @@ def _q_int8_sym(w: torch.Tensor, **kw):
     MAX = 127.0
     amax = w.abs().max().clamp(min=1e-12)
     scale = (amax / MAX).float()
-    w_q = (w.float() / scale).round().clamp(-128, 127)
+    w_q = (w.float() / scale).round().clamp(-128, 127).to(torch.int8)
     return w_q, scale
 
 def _q_int8_affine(w: torch.Tensor, **kw):

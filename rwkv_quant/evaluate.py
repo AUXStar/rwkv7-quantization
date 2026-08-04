@@ -1,10 +1,11 @@
 # coding=utf-8
-"""评估指标：EAR 与 Top-1 一致性。"""
+"""评估指标：EAR 与 Top-1 一致性。
+
+注意：torch 只在 compute_metrics 内导入（懒加载），
+避免 list 等不需要 torch 的命令被拖慢。
+"""
 
 from __future__ import annotations
-
-import torch
-import torch.nn.functional as F
 
 # 评估用 prompt（多领域、长度不一，覆盖常见 token 分布）
 PROMPTS = [
@@ -38,6 +39,9 @@ def compute_metrics(baseline_logits, quantized_logits):
     Top-1: argmax 完全一致的 token 占比。
     返回 (ear, top1)。
     """
+    import torch
+    import torch.nn.functional as F
+
     total_ear = 0.0
     total_match = 0
     total_tokens = 0
