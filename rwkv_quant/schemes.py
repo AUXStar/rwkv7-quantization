@@ -11,54 +11,75 @@ from __future__ import annotations
 # 字段说明：
 #   n     显示名          b      权重位宽          a      激活位宽
 #   c     理论压缩比      hw     硬件要求          col    表格颜色
-#   fmt   存储格式        group  真压缩/"真量化"  或 "近似权重"
-#   desc  方案说明（list 展示用，可用 \n 换行成多行）
+#   fmt   存储格式        group  真量化"true" / 模拟量化"sim"
+#   desc  方案说明（list 展示用）
+#
+# 两种实现方式：
+#   真量化 (true)：quantize 返回 (w_q, scale)，权重真正以 fp8/int8 低精度
+#                 存储，文件大小随之缩小，推理端可反量化回原精度。
+#   模拟量化 (sim)：quantize 先量化成整数、再立刻反量化回浮点，返回的
+#                   是"近似权重"（仍存为 bf16）。文件大小不变，用于在
+#                   实现真正的压缩打包+推理加速之前，先评估该量化算法
+#                   对精度的损失（即"模拟"真实低比特推理的数值效果）。
 SCHEMES = {
-    # ── 真量化：保存 fp8/int8 权重 + scale，文件真正变小 ──
+    # ── 真量化：权重以低精度存储，文件真正变小 ──
     "fp8": dict(
         n="FP8 E4M3", b=8, a=8, c=2.0, hw="SM>=8.9", col="green",
         fmt="float8+scale", group="true",
-        desc="Per-tensor FP8：权重1字节+1个scale，精度高，文件约0.57x，需Ada/Hopper/Blackwell加速",
+        desc="Per-tensor FP8：权重直接存为 float8（1字节）+1个全局scale，推理时乘回。文件约0.57x，精度高。",
     ),
     "fp8_perchannel": dict(
         n="FP8 Per-Channel", b=8, a=8, c=2.0, hw="SM>=8.9", col="green",
         fmt="float8+[N]scale", group="true",
-        desc="逐输出通道独立scale，对离群通道更鲁棒，精度略优于per-tensor",
+        desc="每输出通道独立scale，对离群通道更鲁棒，精度略优于per-tensor。文件约0.57x。",
     ),
     "int8_symmetric": dict(
         n="INT8 Symmetric", b=8, a=8, c=2.0, hw="Any CUDA", col="cyan",
         fmt="int8+scale", group="true",
-        desc="对称INT8：权重1字节+1个scale，通用GPU可跑，文件约0.57x，精度良好",
+        desc="权重直接存为 int8（1字节）+1个scale。任意CUDA GPU可跑，文件约0.57x。",
     ),
 
-    # ── 近似权重：输出反量化后的 bf16 权重，文件大小不变，用于精度对比 ──
+    # ── 模拟量化：量化-反量化后仍存 bf16，文件不变，用于精度评估 ──
     "int8_affine": dict(
         n="INT8 Affine (MM8)", b=8, a=8, c=2.0, hw="Any CUDA", col="cyan",
-        fmt="bf16近似", group="approx",
-        desc="MM8风格非对称INT8：行/列双偏移+双scale，精度最高，输出为近似权重",
+        fmt="bf16近似", group="sim",
+        desc="行/列双偏移+双scale的非对称INT8算法。模拟量化：反量化成近似bf16权重，评估该算法精度。",
     ),
     "int4_symmetric": dict(
         n="INT4 Symmetric", b=4, a=16, c=4.0, hw="Any CUDA", col="red",
-        fmt="bf16近似", group="approx",
-        desc="对称INT4：理论4x压缩，精度损失大，输出为近似权重",
+        fmt="bf16近似", group="sim",
+        desc="对称INT4（理论4x压缩）。模拟量化：近似bf16权重。4bit打包+解码未实现。",
     ),
     "int4_groupwise_128": dict(
         n="INT4 Group g=128", b=4, a=16, c=3.5, hw="Any CUDA", col="red",
-        fmt="bf16近似", group="approx",
-        desc="每128通道一组量化，组内独立scale/zero，精度优于per-tensor",
+        fmt="bf16近似", group="sim",
+        desc="每128通道一组，组内独立scale/zero，精度优于per-tensor。模拟量化。",
     ),
     "int4_groupwise_256": dict(
         n="INT4 Group g=256", b=4, a=16, c=3.7, hw="Any CUDA", col="red",
-        fmt="bf16近似", group="approx",
-        desc="每256通道一组量化，压缩比略高，精度稍低",
+        fmt="bf16近似", group="sim",
+        desc="每256通道一组，压缩比略高，精度稍低。模拟量化。",
     ),
 }
 
 # 分组标签（list 表格的分隔标题）
 GROUP_LABELS = {
-    "true": "真量化 · 文件真正变小",
-    "approx": "近似权重 · 文件大小不变（精度对比用）",
+    "true": "真量化 · 权重以低精度存储，文件变小",
+    "sim": "模拟量化 · 量化后仍存 bf16，文件不变",
 }
+
+# 量化类型短标签（list 表格 Type 列）
+GROUP_TYPE = {
+    "true": "真量化",
+    "sim": "模拟量化",
+}
+
+# 表格底部脚注：解释"模拟量化"是什么
+LIST_FOOTNOTE = (
+    "说明：\"模拟量化\" = 先按低比特规则量化、再立即反量化回浮点权重（仍存bf16，文件不变）。"
+    "它在实现真正的压缩打包+推理加速之前，先估算该算法的精度损失。"
+    "当前只有 fp8 / int8_symmetric 会真正压缩文件。"
+)
 
 
 # ── 权重分类 ──────────────────────────────────────────────────

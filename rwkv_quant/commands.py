@@ -14,7 +14,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-from .schemes import SCHEMES, GROUP_LABELS, classify, load_state, compact_state
+from .schemes import SCHEMES, GROUP_LABELS, GROUP_TYPE, LIST_FOOTNOTE, classify, load_state, compact_state
 from .utils import ROOT, hs, err_exit, C, hd, ok, dm, BD, wr, mg
 
 try:  # rich 可选：提供更漂亮的表格/进度条
@@ -69,6 +69,7 @@ def cmd_list(args) -> int:
         table = Table(title="✦ Quantization Schemes ✦", box=box.ROUNDED,
                       header_style="bold magenta", title_justify="center")
         table.add_column("Scheme", style="bold", no_wrap=False)
+        table.add_column("Type", justify="center")
         table.add_column("Bits", justify="center")
         table.add_column("Act", justify="center")
         table.add_column("Comp", justify="center")
@@ -77,17 +78,18 @@ def cmd_list(args) -> int:
         table.add_column("说明", overflow="fold")
 
         # 按分组顺序输出，组之间用分隔线
-        for gi, group in enumerate(("true", "approx")):
+        for gi, group in enumerate(("true", "sim")):
             if gi > 0:
                 table.add_section()
             # 分组标题行：用跨列文本（后续单元格留空）
             table.add_row(Text(GROUP_LABELS[group], style="bold magenta underline"),
-                          "", "", "", "", "", "")
+                          "", "", "", "", "", "", "")
             for name, s in SCHEMES.items():
                 if s.get("group") != group:
                     continue
                 table.add_row(
                     f"[{s['col']}]{name}[/]",
+                    f"[{s['col']}]{GROUP_TYPE[group]}[/]",
                     f"{s['b']}W",
                     f"{s['a']}A",
                     f"[{s['col']}]{s['c']:.1f}x[/]",
@@ -96,17 +98,19 @@ def cmd_list(args) -> int:
                     f"[{s['col']}]{s['desc']}[/]",
                 )
         _r.print(table)
+        _r.print(Text(LIST_FOOTNOTE, style="dim italic"))
     else:
         print(f"\n{hd('✦ Quantization Schemes ✦')}")
-        for group in ("true", "approx"):
+        for group in ("true", "sim"):
             print(f"\n  {mg('▸ ' + GROUP_LABELS[group])}")
             print(f"  {dm('─' * 100)}")
             for name, s in SCHEMES.items():
                 if s.get("group") != group:
                     continue
-                print(f"  {ok(name):22s} {s['b']}W{s['a']}A  {s['c']:4.1f}x  {s['fmt']:>15s}  {s['hw']:>9s}")
+                print(f"  {ok(name):22s} [{GROUP_TYPE[group]}] {s['b']}W{s['a']}A  {s['c']:4.1f}x  {s['fmt']:>15s}  {s['hw']:>9s}")
                 print(f"  {dm(' ' * 22 + '↳ ')}{s['desc']}")
         print(f"  {dm('─' * 100)}")
+        print(f"  {dm(LIST_FOOTNOTE)}")
     return 0
 
 
