@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+import argparse,gc,json,os,sys,time,math
+from pathlib import Path
+
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich import box
+    _r=Console();_RICH=True
+except ImportError:
+    _r=None;_RICH=False
+
+ENGINE=os.environ.get("RWKV_ENGINE","/home/njzy/test/Albatross/faster3a_2607")
+VOCAB=os.environ.get("RWKV_VOCAB","/home/njzy/RWKV-Server/rwkv_vocab_v20230424.txt")
+SELF=str(Path(__file__).parent)
+
+SCHEMES={"fp8":dict(n="FP8 E4M3",b=8,a=8,c=2.0,hw="SM>=8.9"),"fp8_perchannel":dict(n="FP8 Per-Channel",b=8,a=8,c=2.0,hw="SM>=8.9"),"int8_symmetric":dict(n="INT8 Symmetric",b=8,a=8,c=2.0,hw="Any CUDA"),"int8_affine":dict(n="INT8 Affine",b=8,a=8,c=2.0,hw="Any CUDA"),"int4_symmetric":dict(n="INT4 Symmetric",b=4,a=16,c=4.0,hw="Any CUDA"),"int4_groupwise_128":dict(n="INT4 Group g=128",b=4,a=16,c=3.5,hw="Any CUDA"),"int4_groupwise_256":dict(n="INT4 Group g=256",b=4,a=16,c=3.7,hw="Any CUDA")}
+
+R="\033[0m";B="\033[1m";CY="\033[36M";GN="\033[32M";RD="\033[31M"
+def C(t,c):return f"{c}{t}{R}" if sys.stdout.isatty() else str(t)
+def hd(t): return C(t,B+CY)
+def ok(t): return C(t,GN)
+def er(t): return C(t,RD)
+def hs(n):
+    for u in("B","KB","MB","GB","TB"):
+        if abs(n)<1024:return f"{n:.1f}{u}"
+        n/=1024
+
+def rt(title,cols,rows):
+    if _RICH:
+        t=Table(title=hd(title),box=box.ROUNDED)
+        for c_,w in cols:t.add_column(c_,width=w)
+        for r in rows:t.add_row(*[str(x) for x in r])
+        _r.print(t)
+    else:
+        print(f"\n  {title}");[print(f"  {chr(32).join(str(x) for x in r)}") for r in rows]
+
+QUANT={"att_r","att_k","att_v","att_o","ffn_k","ffn_v"}
+CM={"receptance":"att_r","key":"att_k","value":"att_v","output":"att_o"}
+FM={"key":"ffn_k","value":"ffn_v"}
+def clsf(k,nl):
+    ps=k.split(".")
+    if len(ps)<4 or ps[0]!="blocks":return None
+    try:ly=int(ps[1])
+    except:return None
+    if ly<0 or ly>=nl:return None
+    c=CM.get(ps[3]) if ps[2]=="att" else (FM.get(ps[3]) if ps[2]=="ffn" else None)
+    return (ly,c) if c in QUANT else None
+
+PROMPTS=["The capital of France is","In machine learning, gradient descent is","def fibonacci(n):","To solve 2x+5=11","Binary search is O(","Largest planet is","Water boils at 100","Quick brown fox","Python list comprehension","Derivative of x^2","Sort a list in Python","Binary search function","Pythagorean theorem","import torch","AI in 2025","Neural network 3 layers","Chemical symbol gold","Photosynthesis converts","Square root of 144","def reverse_linked_list(head):"]
+
+def _load(path,prompts):
+    import torch
+    sys.path.insert(0,ENGINE);import rwkv7_fast_v3a as v3a
+    from rwkv.rwkv_tokenizer import TRIE_TOKENIZER;import rwkv
+    tok=TRIE_TOKENIZER(VOCAB)
+    v3a.MODEL_PATH=path;v3a.WKV_MODE="fp16";v3a.EMB_DEVICE="cpu"
+    v3a.RKV_MODE="off";v3a.CMIX_SPARSE="off";v3a.LOWRANK_WEIGHT="transpose"
+    v3a.ORIG_LINEAR_GROUPS={"head"};v3a.load_extensions(v3a.WKV_MODE)
+    model=v3a.RWKV7();logs=[]
+    for pr in prompts:
+        toks=tok.encode(pr)[:512]
+        inp=torch.tensor(toks,dtype=torch.long,device="cuda").unsqueeze(0)
+        st=model.zero_state(1)
+        with torch.no_grad():lg=model.forward_all_logits(inp,st)
+        if lg.dim()==3:lg=lg[0]
+        logs.append(lg.cpu().float())
+    del model
+    for m in list(sys.modules.keys()):
+        if any(x in m for x in ["fp8_ops","fused_fp8","rwkv7_fast"]):del sys.modules[m]
+    gc.collect();torch.cuda.empty_cache()
+    return logs
+
+def _ear(lo,lq):
+    import torch,torch.nn.functional as F
+    te=tt=t=0.0
+    for a,b in zip(lo,lq):
+        mn=min(a.size(0),b.size(0));a,b=a[:mn],b[:mn]
+        pa,pb=F.softmax(a,-1),F.softmax(b,-1)
+        te+=torch.minimum(pa,pb).sum().item()
+        tt+=(a.argmax(-1)==b.argmax(-1)).float().sum().item()
+        t+=mn
+    return te/t,tt/t
+
+def _speed(path,warmup=3,steps=20):
+    import torch
+    sys.path.insert(0,ENGINE);import rwkv7_fast_v3a as v3a
+    from rwkv.rwkv_tokenizer import TRIE_TOKENIZER;import rwkv
+    tok=TRIE_TOKENIZER(VOCAB)
+    v3a.MODEL_PATH=path;v3a.WKV_MODE="fp16";v3a.EMB_DEVICE="cpu"
+    v3a.RKV_MODE="off";v3a.CMIX_SPARSE="off";v3a.LOWRANK_WEIGHT="transpose"
+    v3a.ORIG_LINEAR_GROUPS={"head"};v3a.load_extensions(v3a.WKV_MODE)
+    model=v3a.RWKV7()
+    toks=tok.encode("Write a Python function")[:128]
+    inp=torch.tensor(toks,dtype=torch.long,device="cuda").unsqueeze(0)
+    for _ in range(warmup):st=model.zero_state(1);model.forward(inp,st)
+    torch.cuda.synchronize();t0=time.time();st=model.zero_state(1)
+    with torch.no_grad():
+        model.forward(inp,st)
+        for _ in range(steps):
+            nt=torch.argmax(st[-1][-1]).unsqueeze(0).unsqueeze(0)
+            model.forward(nt,st)
+    torch.cuda.synchronize();dt=time.time()-t0;del model
+    for m in list(sys.modules.keys()):
+        if any(x in m for x in ["fp8_ops","fused_fp8","rwkv7_fast"]):del sys.modules[m]
+    gc.collect();torch.cuda.empty_cache()
+    return steps/dt
+# ═══════════════════════════════════════════════════════════
+# Commands
+# ═══════════════════════════════════════════════════════════
+def cmd_info(args):
+    import torch;p=args.model
+    if not os.path.exists(p):print(er(f"Not found: {p}"));return 1
+    z=torch.load(p,map_location="cpu",weights_only=True)
+    nl=max((int(k.split(".")[1]) for k in z if k.startswith("blocks.") and len(k.split("."))>=2),default=0)+1
+    w0=z.get("blocks.0.att.receptance.weight");C_=w0.shape[1] if w0 is not None else "?"
+    V=z.get("emb.weight",None);V=V.shape[0] if V is not None else "?"
+    fp=sum(v.numel() for v in z.values() if hasattr(v,"numel"))
+    meta=z.get("quant_meta") or z.get("meta")
+    quant=meta.get("scheme") or meta.get("quantization") if meta else "No"
+    print(f"\n  {hd("Model Info")}")
+    print(f"  File:       {p}")
+    print(f"  Size:       {hs(os.path.getsize(p))}")
+    print(f"  Layers:     {nl}")
+    print(f"  Hidden:     {C_}")
+    print(f"  Vocab:      {V}")
+    print(f"  Params:     {fp:,}")
+    print(f"  Quantized:  {quant}")
+    return 0
+
+def cmd_list(args):
+    rt("Quantization Schemes",[("Scheme",20),("Bits",5),("Act",4),("Comp",6),("HW Req",12)],
+        [(k,f"{s["b"]}W",f"{s["a"]}A",f"{s["c"]:.1f}x",s["hw"]) for k,s in SCHEMES.items()])
+    return 0
+
+def cmd_quantize(args):
+    import torch;p,o,s=args.model,args.output,args.scheme
+    if not p:print(er("Need -m"));return 1
+    if not o:print(er("Need -o"));return 1
+    if s not in SCHEMES:print(er(f"Unknown scheme: {s}"));return 1
+    sys.path.insert(0,SELF)
+    from schemes import get_scheme as gs
+    sch=gs(s);qfn=sch["quantize"];qkw=dict(sch.get("quantize_kwargs",{}))
+    print(f"\n  {hd("Scheme:")} {sch["name"]}")
+    print(f"  Loading: {p}...");t0=time.time()
+    z=torch.load(p,map_location="cpu",weights_only=True)
+    nl=max((int(k.split(".")[1]) for k in z if k.startswith("blocks.") and len(k.split("."))>=2),default=0)+1
+    print(f"  {nl} layers, {len(z)} keys")
+    qc=0
+    for k in list(z.keys()):
+        if clsf(k,nl) is None:continue
+        w=z[k].float();z[k]=qfn(w,**qkw);qc+=1
+    z["quant_meta"]={"scheme":s,"format":sch["format"],"ts":time.strftime("%Y-%m-%d %H:%M:%S")}
+    os.makedirs(os.path.dirname(o) or ".",exist_ok=True);torch.save(z,o)
+    sz=os.path.getsize(o);orig=os.path.getsize(p);dt=time.time()-t0
+    print(f"  {ok(f"Done: {qc} weights")} in {dt:.1f}s")
+    print(f"  {hs(orig)} -> {hs(sz)} ({orig/max(sz,1):.2f}x)")
+    return 0
+
+def cmd_compare(args):
+    import torch;p,od=args.model,args.outdir
+    if not p:print(er("Need -m"));return 1
+    od=od or "./compare_out";os.makedirs(od,exist_ok=True)
+    sys.path.insert(0,SELF)
+    from schemes import get_scheme as gs
+    orig=os.path.getsize(p);print(f"\n  Source: {p} ({hs(orig)})")
+    z_orig=torch.load(p,map_location="cpu",weights_only=True)
+    nl=max((int(k.split(".")[1]) for k in z_orig if k.startswith("blocks.") and len(k.split("."))>=2),default=0)+1
+    results=[]
+    for sn,ss in SCHEMES.items():
+        sch=gs(sn);qfn=sch["quantize"];qkw=dict(sch.get("quantize_kwargs",{}))
+        z={k:v.clone() if hasattr(v,"clone") else v for k,v in z_orig.items()}
+        for k in list(z.keys()):
+            if clsf(k,nl) is None:continue
+            w=z[k].float();z[k]=qfn(w,**qkw)
+        out=os.path.join(od,f"model_{sn}.pth")
+        torch.save(z,out);del z;gc.collect()
+        sz=os.path.getsize(out)
+        results.append(dict(s=sn,n=ss["n"],sz=sz,r=sz/orig))
+        print(f"  {ok(sn):40s} -> {hs(sz):>8s} ({sz/orig:.2f}x)")
+    rt("Comparison",[("Scheme",20),("Name",20),("Size",8),("Ratio",6)],
+        [(r["s"],r["n"],hs(r["sz"]),f"{r["r"]:.2f}x") for r in results])
+    return 0
+
+def cmd_eval(args):
+    b,q=args.baseline,args.quantized
+    if not b or not q:print(er("Need -b and -q"));return 1
+    print(f"\n  {hd("Loading baseline:")} {b}")
+    lb=_load(b,PROMPTS);bs=_speed(b)
+    print(f"  Baseline: {ok(f"{bs:.1f} tok/s")}")
+    for qp in q.split(",") if "," in q else [q]:
+        nm=Path(qp).stem;print(f"\n  {hd(f"Evaluating: {nm}")}")
+        lq=_load(qp,PROMPTS);ear,top1=_ear(lb,lq);sp=_speed(qp)
+        print(f"    EAR:    {ear:.6f}")
+        print(f"    Top-1:  {top1*100:.2f}%")
+        print(f"    Speed:  {sp:.1f} tok/s ({sp/bs:.2f}x)")
+        print(f"    Size:   {hs(os.path.getsize(qp))}")
+    return 0
+
+def cmd_sensitivity(args):
+    import torch;p=args.model
+    if not p:print(er("Need -m"));return 1
+    z=torch.load(p,map_location="cpu",weights_only=True)
+    nl=max((int(k.split(".")[1]) for k in z if k.startswith("blocks.") and len(k.split("."))>=2),default=0)+1
+    print(f"\n  {hd("Analyzing:")} {p} ({nl} layers)")
+    from collections import defaultdict;groups=defaultdict(list)
+    for k in sorted(z.keys()):
+        v=z[k];info=clsf(k,nl);comp=info[1] if info else "other"
+        if isinstance(v,torch.Tensor) and v.dim()==2 and v.numel()>=10000:
+            wf=v.float();std_v=float(wf.std())
+            sk=float(((wf-wf.mean())**3).mean()/(std_v**3+1e-20))
+            ku=float(((wf-wf.mean())**4).mean()/(std_v**4+1e-20)-3)
+            groups[comp].append(dict(k=k,shape=list(v.shape),mean=round(float(wf.mean()),4),std=round(std_v,4),skew=round(sk,3),kurt=round(ku,3)))
+    cols=[("Component",14),("Count",5),("Avg Std",8),("Avg Skew",8),("Avg Kurt",8)]
+    rows=[]
+    for comp in sorted(groups.keys()):
+        gs_=groups[comp];n=len(gs_)
+        if n==0:continue
+        avg_std=sum(x["std"] for x in gs_)/n
+        avg_skew=sum(x["skew"] for x in gs_)/n
+        avg_kurt=sum(x["kurt"] for x in gs_)/n
+        rows.append((comp,str(n),f"{avg_std:.4f}",f"{avg_skew:+.3f}",f"{avg_kurt:+.3f}"))
+    rt("Component Statistics",cols,rows)
+    return 0
+def main():
+    ap=argparse.ArgumentParser(prog="rqkv",description="RWKV-7 Quantization Toolkit",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:\n  rqkv info -m model.pth\n  rqkv list\n  rqkv quantize -m model.pth -o q.pth -s fp8\n  rqkv compare -m model.pth\n  rqkv eval -b orig.pth -q q.pth\n  rqkv sensitivity -m model.pth")
+    sp=ap.add_subparsers(dest="cmd",help="command")
+    # info
+    s=sp.add_parser("info",help="Show model info");s.add_argument("-m","--model",required=True)
+    # list
+    sp.add_parser("list",help="List quantization schemes")
+    # quantize
+    s=sp.add_parser("quantize",help="Quantize a model")
+    s.add_argument("-m","--model",required=True);s.add_argument("-o","--output",required=True)
+    s.add_argument("-s","--scheme",default="fp8")
+    # compare
+    s=sp.add_parser("compare",help="Compare all schemes")
+    s.add_argument("-m","--model",required=True);s.add_argument("-C","--outdir",default=None)
+    # eval
+    s=sp.add_parser("eval",help="Evaluate quantized model")
+    s.add_argument("-b","--baseline",required=True);s.add_argument("-q","--quantized",required=True)
+    # sensitivity
+    s=sp.add_parser("sensitivity",help="Per-tensor sensitivity analysis")
+    s.add_argument("-m","--model",required=True)
+
+    args=ap.parse_args()
+    if not args.cmd:ap.print_help();return 0
+    CMDS={"info":cmd_info,"list":cmd_list,"quantize":cmd_quantize,"compare":cmd_compare,"eval":cmd_eval,"sensitivity":cmd_sensitivity}
+    return CMDS[args.cmd](args)
+
+if __name__=="__main__":raise SystemExit(main())
