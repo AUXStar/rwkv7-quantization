@@ -138,9 +138,15 @@ def cmd_list(args):
 
 def cmd_quantize(args):
     import torch;p,o,s=args.model,args.output,args.scheme
-    if not p:print(er("Need -m"));return 1
-    if not o:print(er("Need -o"));return 1
-    if s not in SCHEMES:print(er(f"Unknown scheme: {s}"));return 1
+    if not p:print(er("Error: -m/--model is required"));return 1
+    if not o:print(er("Error: -o/--output is required"));return 1
+    if s not in SCHEMES:print(er(f"Error: Unknown scheme '{s}'. Use 'rwkv-quant l' to list schemes"));return 1
+    # Smart output: if directory, auto-generate filename
+    if os.path.isdir(o) or o.endswith("/") or o.endswith(os.sep):
+        ts=time.strftime("%Y%m%d_%H%M%S")
+        name=Path(p).stem
+        o=os.path.join(o,f"{name}_{s}_{ts}.pth")
+        print(f"  Auto output: {o}")
     sys.path.insert(0,SELF)
     from schemes import get_scheme as gs
     sch=gs(s);qfn=sch["quantize"];qkw=dict(sch.get("quantize_kwargs",{}))
@@ -280,17 +286,17 @@ def main():
     sp.add_parser("list",help="List quantization schemes [aliases: l, li]")
     # quantize
     s=sp.add_parser("quantize",help="Quantize a model [aliases: q, quant]")
-    s.add_argument("-m","--model",required=True);s.add_argument("-o","--output",required=True)
+    s.add_argument("-m","--model",default=None);s.add_argument("-o","--output",default=None)
     s.add_argument("-s","--scheme",default="fp8")
     # compare
     s=sp.add_parser("compare",help="Compare all schemes [aliases: c, cmp]")
-    s.add_argument("-m","--model",required=True);s.add_argument("-C","--outdir",default=None)
+    s.add_argument("-m","--model",default=None);s.add_argument("-C","--outdir",default=None)
     # eval
     s=sp.add_parser("eval",help="Evaluate quantized model [aliases: e, eval]")
-    s.add_argument("-b","--baseline",required=True);s.add_argument("-q","--quantized",required=True)
+    s.add_argument("-b","--baseline",default=None);s.add_argument("-q","--quantized",default=None)
     # sensitivity
     s=sp.add_parser("sensitivity",help="Per-tensor sensitivity [aliases: s, sens]")
-    s.add_argument("-m","--model",required=True)
+    s.add_argument("-m","--model",default=None)
 
     ABBREV = {"l":"list","li":"list","i":"info","q":"quantize","quant":"quantize","c":"compare","cmp":"compare","e":"eval","s":"sensitivity","sens":"sensitivity"}
     if sys.argv[1:] and sys.argv[1] in ABBREV:
