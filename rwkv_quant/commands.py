@@ -14,12 +14,13 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-from .schemes import SCHEMES, classify, load_state, compact_state
-from .utils import ROOT, hs, err_exit, C, hd, ok, dm, BD, wr
+from .schemes import SCHEMES, GROUP_LABELS, classify, load_state, compact_state
+from .utils import ROOT, hs, err_exit, C, hd, ok, dm, BD, wr, mg
 
 try:  # rich 可选：提供更漂亮的表格/进度条
     from rich.console import Console
     from rich.table import Table
+    from rich.text import Text
     from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
     from rich import box
     _r = Console()
@@ -66,25 +67,46 @@ def _store_quantized(state: dict, key: str, result, orig_dtype):
 def cmd_list(args) -> int:
     if RICH:
         table = Table(title="✦ Quantization Schemes ✦", box=box.ROUNDED,
-                      header_style="bold magenta")
-        table.add_column("Scheme", style="bold")
+                      header_style="bold magenta", title_justify="center")
+        table.add_column("Scheme", style="bold", no_wrap=False)
         table.add_column("Bits", justify="center")
         table.add_column("Act", justify="center")
         table.add_column("Comp", justify="center")
+        table.add_column("Storage", justify="left")
         table.add_column("HW", justify="center")
-        table.add_column("Description")
-        for name, s in SCHEMES.items():
-            table.add_row(f"[{s['col']}]{name}[/]", f"{s['b']}W", f"{s['a']}A",
-                          f"[{s['col']}]{s['c']:.1f}x[/]", f"[yellow]{s['hw']}[/]",
-                          f"[{s['col']}]{s['desc']}[/]")
+        table.add_column("说明", overflow="fold")
+
+        # 按分组顺序输出，组之间用分隔线
+        for gi, group in enumerate(("true", "approx")):
+            if gi > 0:
+                table.add_section()
+            # 分组标题行：用跨列文本（后续单元格留空）
+            table.add_row(Text(GROUP_LABELS[group], style="bold magenta underline"),
+                          "", "", "", "", "", "")
+            for name, s in SCHEMES.items():
+                if s.get("group") != group:
+                    continue
+                table.add_row(
+                    f"[{s['col']}]{name}[/]",
+                    f"{s['b']}W",
+                    f"{s['a']}A",
+                    f"[{s['col']}]{s['c']:.1f}x[/]",
+                    f"[{s['col']}]{s['fmt']}[/]",
+                    f"[yellow]{s['hw']}[/]",
+                    f"[{s['col']}]{s['desc']}[/]",
+                )
         _r.print(table)
     else:
         print(f"\n{hd('✦ Quantization Schemes ✦')}")
-        print(f"  {dm('─' * 90)}")
-        for name, s in SCHEMES.items():
-            print(f"  {ok(name):22s} {s['b']}W{s['a']}A {s['c']:4.1f}x  {s['hw']:>9s}")
-            print(f"  {dm(' ' * 22 + '↳ ')}{s['desc']}")
-        print(f"  {dm('─' * 90)}")
+        for group in ("true", "approx"):
+            print(f"\n  {mg('▸ ' + GROUP_LABELS[group])}")
+            print(f"  {dm('─' * 100)}")
+            for name, s in SCHEMES.items():
+                if s.get("group") != group:
+                    continue
+                print(f"  {ok(name):22s} {s['b']}W{s['a']}A  {s['c']:4.1f}x  {s['fmt']:>15s}  {s['hw']:>9s}")
+                print(f"  {dm(' ' * 22 + '↳ ')}{s['desc']}")
+        print(f"  {dm('─' * 100)}")
     return 0
 
 
