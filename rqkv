@@ -12,7 +12,7 @@ except ImportError:
     _r=None;_RICH=False
 
 ENGINE=os.environ.get("RWKV_ENGINE","/home/njzy/test/Albatross/faster3a_2607")
-VOCAB=os.environ.get("RWKV_VOCAB","/home/njzy/RWKV-Server/rwkv_vocab_v20230424.txt")
+VOCAB=os.environ.get("RWKV_VOCAB","/home/njzy/RWKV-Server/.venv/lib/python3.13/site-packages/rwkv/rwkv_vocab_v20230424.txt")
 SELF=str(Path(__file__).parent)
 
 SCHEMES={"fp8":dict(n="FP8 E4M3",b=8,a=8,c=2.0,hw="SM>=8.9"),"fp8_perchannel":dict(n="FP8 Per-Channel",b=8,a=8,c=2.0,hw="SM>=8.9"),"int8_symmetric":dict(n="INT8 Symmetric",b=8,a=8,c=2.0,hw="Any CUDA"),"int8_affine":dict(n="INT8 Affine",b=8,a=8,c=2.0,hw="Any CUDA"),"int4_symmetric":dict(n="INT4 Symmetric",b=4,a=16,c=4.0,hw="Any CUDA"),"int4_groupwise_128":dict(n="INT4 Group g=128",b=4,a=16,c=3.5,hw="Any CUDA"),"int4_groupwise_256":dict(n="INT4 Group g=256",b=4,a=16,c=3.7,hw="Any CUDA")}
