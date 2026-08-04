@@ -138,9 +138,9 @@ def cmd_list(args):
 
 def cmd_quantize(args):
     import torch;p,o,s=args.model,args.output,args.scheme
-    if not p:print(er("Error: -m/--model is required"));return 1
-    if not o:print(er("Error: -o/--output is required"));return 1
-    if s not in SCHEMES:print(er(f"Error: Unknown scheme '{s}'. Use 'rwkv-quant l' to list schemes"));return 1
+    if not p: print("Error: -m/--model is required", file=sys.stderr); return 1
+    if not o: print("Error: -o/--output is required", file=sys.stderr); return 1
+    if s not in SCHEMES: print(f"Error: Unknown scheme '{s}'. Use 'rwkv-quant l' to list schemes", file=sys.stderr); return 1
     # Smart output: if directory, auto-generate filename
     if os.path.isdir(o) or o.endswith("/") or o.endswith(os.sep):
         ts=time.strftime("%Y%m%d_%H%M%S")
@@ -212,7 +212,7 @@ def cmd_quantize(args):
 
 def cmd_compare(args):
     import torch;p,od=args.model,args.outdir
-    if not p:print(er("Need -m"));return 1
+    if not p: print("Error: -m/--model is required", file=sys.stderr); return 1
     od=od or "./compare_out";os.makedirs(od,exist_ok=True)
     sys.path.insert(0,SELF)
     from schemes import get_scheme as gs
@@ -237,7 +237,7 @@ def cmd_compare(args):
 
 def cmd_eval(args):
     b,q=args.baseline,args.quantized
-    if not b or not q:print(er("Need -b and -q"));return 1
+    if not b or not q: print("Error: -b/--baseline and -q/--quantized are required", file=sys.stderr); return 1
     print(f"\n  {hd("Loading baseline:")} {b}")
     lb=_load(b,PROMPTS);bs=_speed(b)
     print(f"  Baseline: {ok(f"{bs:.1f} tok/s")}")
@@ -252,7 +252,7 @@ def cmd_eval(args):
 
 def cmd_sensitivity(args):
     import torch;p=args.model
-    if not p:print(er("Need -m"));return 1
+    if not p: print("Error: -m/--model is required", file=sys.stderr); return 1
     z=torch.load(p,map_location="cpu",weights_only=True)
     nl=max((int(k.split(".")[1]) for k in z if k.startswith("blocks.") and len(k.split("."))>=2),default=0)+1
     print(f"\n  {hd("Analyzing:")} {p} ({nl} layers)")
