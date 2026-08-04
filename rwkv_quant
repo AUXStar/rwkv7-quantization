@@ -24,6 +24,7 @@ except ImportError:
 ENGINE = os.environ.get("RWKV_ENGINE", "/home/njzy/test/Albatross/faster3a_2607")
 VOCAB = os.environ.get("RWKV_VOCAB", "/home/njzy/RWKV-Server/.venv/lib/python3.13/site-packages/rwkv/rwkv_vocab_v20230424.txt")
 SELF = str(Path(__file__).parent)
+NO_BANNER = os.environ.get("RWKV_QUANT_NO_BANNER", "0") == "1"
 
 SCHEMES = {
     "fp8":                dict(n="FP8 E4M3",            b=8, a=8,  c=2.0, hw="SM>=8.9",  col="green"),
@@ -77,7 +78,8 @@ BANNER_ASCII = r"""
 """
 
 def show_banner():
-    """Big fat banner."""
+    """Big fat banner. Skip if NO_BANNER."""
+    if NO_BANNER: return
     if _RICH:
         _r.print(Panel.fit(
             BANNER_RICH.strip("\n") +
@@ -406,6 +408,7 @@ def main():
   rwkv-quant eval -b orig.pth -q q.pth
   rwkv-quant sensitivity -m model.pth
 Aliases: i/l/q/c/e/s""")
+    ap.add_argument("-B","--no-banner", action="store_true", help="skip banner (faster)")
     sp=ap.add_subparsers(dest="cmd",help="command")
     s=sp.add_parser("info",help="Show model info [i]");s.add_argument("-m","--model",default=None)
     sp.add_parser("list",help="List quantization schemes [l]")
@@ -414,9 +417,16 @@ Aliases: i/l/q/c/e/s""")
     s=sp.add_parser("eval",help="Evaluate quantized model [e]");s.add_argument("-b","--baseline",default=None);s.add_argument("-q","--quantized",default=None)
     s=sp.add_parser("sensitivity",help="Per-tensor stats [s]");s.add_argument("-m","--model",default=None)
 
+    global NO_BANNER
+    if "--no-banner" in sys.argv or "-B" in sys.argv:
+        NO_BANNER = True
     ABBREV={"l":"list","li":"list","i":"info","q":"quantize","quant":"quantize","c":"compare","cmp":"compare","e":"eval","s":"sensitivity","sens":"sensitivity"}
-    if sys.argv[1:] and sys.argv[1] in ABBREV:
-        sys.argv[1]=ABBREV[sys.argv[1]]
+    # Scan argv for the first positional (subcommand) and expand abbreviation
+    for _i, _a in enumerate(sys.argv[1:]):
+        if not _a.startswith("-"):
+            if _a in ABBREV:
+                sys.argv[_i+1]=ABBREV[_a]
+            break
 
     args=ap.parse_args()
     if not args.cmd:
@@ -425,8 +435,8 @@ Aliases: i/l/q/c/e/s""")
         return 0
     CMDS={"info":cmd_info,"list":cmd_list,"quantize":cmd_quantize,"compare":cmd_compare,"eval":cmd_eval,"sensitivity":cmd_sensitivity}
     if args.cmd not in CMDS: err_exit(f"unknown command '{args.cmd}'")
-    # Show banner for all commands except --help handled above
-    if args.cmd not in ("list",):
+    # Show banner only for heavy commands, and only if not suppressed
+    if args.cmd in ("quantize","compare","eval","sensitivity","info"):
         show_banner()
     return CMDS[args.cmd](args)
 
