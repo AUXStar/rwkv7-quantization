@@ -718,12 +718,9 @@ def linear_quantized_fused(x, weight_info, out_dtype=torch.float16):
     qtype = weight_info.get("qtype", "fp8")
     M = x.numel() // x.size(-1)
     if M <= FUSED_M_MAX:
-        if qtype in ("fp8", "fp8_w8a16"):
+        if qtype == "fp8":  # 只存在 W8A8 真量化域，无 w8a16
             return linear_fp8_fused(x, weight_info, out_dtype)
-    # Large M: _scaled_mm
-    if qtype == "fp8_w8a16":
-        from fp8_ops import linear_fp8_w8a16
-        return linear_fp8_w8a16(x, weight_info, out_dtype)
+    # Large M: _scaled_mm（FP8 张量核，保持 FP8 域，禁止反量化）
     return linear_fp8(x, weight_info, out_dtype)
 
 

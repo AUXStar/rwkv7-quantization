@@ -5,7 +5,7 @@ Provides:
 - is_fp8_weight: detect FP8 quantized weights (has .fp8_scale sibling)
 - load_fp8_weight: load FP8 weight + per-tensor scale
 - linear_fp8: FP8 GEMM (FP8×FP8→BF16) with online activation quantization
-- linear_fp8_w8a16: FP8 W8A16 GEMM (dequant weight→BF16, FP16 activation)
+- (已移除) 反量化路径已删除：FP8 权重永远保持 FP8，只走张量核
 - linear_quantized: dispatcher that picks the right GEMM based on weight_info
 """
 import torch
@@ -23,15 +23,11 @@ def is_fp8_weight(z, key):
 # Loading
 # ============================================================================
 
-def load_fp8_weight(z, key, dev, w8a16=False):
-    """Load FP8 weight: float8_e4m3fn + per-tensor scale.
+def load_fp8_weight(z, key, dev):
+    """Load FP8 weight: float8_e4m3fn + per-tensor scale (W8A8, 禁止反量化).
 
-    Args:
-        z: weight dict
-        key: weight key
-        dev: target device
-        w8a16: if True, use W8A16 path (weight-only, FP16 activation).
-               if False, use W8A8 path (both weight and activation quantized).
+    FP8 权重只允许保持 FP8 域，由 FP8 张量核（_scaled_mm / tl.dot(fp8,fp8)）计算，
+    绝不反量化回 fp16/bf16 再 GEMM。
 
     Removes the .fp8_scale key from z.
     Returns a dict with weight, tensor_scale (scalar), qtype.
@@ -42,7 +38,7 @@ def load_fp8_weight(z, key, dev, w8a16=False):
     return {
         "weight": w,
         "tensor_scale": scale,
-        "qtype": "fp8_w8a16" if w8a16 else "fp8",
+        "qtype": "fp8",  # 固定 W8A8 真量化域，禁止 w8a16 反量化
     }
 
 
@@ -92,47 +88,10 @@ def linear_fp8(x, weight_info, out_dtype=torch.float16):
     return out
 
 
-def linear_fp8_w8a16(x, weight_info, out_dtype=torch.float16):
-    """FP8 W8A16 GEMM: dequantize weight to FP16, then FP16 GEMM.
-
-    Weight-only quantization: activations stay at FP16 precision.
-    Eliminates FP8 activation quantization error.
-
-    Args:
-        x: [B, T, K] or [M, K] fp16/bf16 input
-        weight_info: dict from load_fp8_weight (w8a16=True)
-        out_dtype: output dtype
-
-    Returns:
-        [B, T, N] or [M, N] in out_dtype
-    """
-    w = weight_info["weight"]              # [N, K] float8_e4m3fn
-    w_scale = weight_info["tensor_scale"]  # scalar float32
-
-    # Dequantize weight: FP8 -> FP16, then multiply by scale
-    w_fp16 = w.to(torch.float16) * w_scale.to(torch.float16)
-
-    # Reshape input
-    orig_shape = x.shape
-    x_2d = x.reshape(-1, orig_shape[-1]).contiguous()
-    if x_2d.dtype == torch.bfloat16:
-        x_2d = x_2d.to(torch.float16)
-
-    # FP16 GEMM
-    out = torch.mm(x_2d, w_fp16.t())  # [M, N]
-
-    N = w.size(0)
-    out = out.reshape(*orig_shape[:-1], N)
-    if out_dtype != out.dtype:
-        out = out.to(out_dtype)
-    return out
-
 
 def linear_quantized(x, weight_info, out_dtype=torch.float16):
     """Dispatcher: pick the right GEMM based on qtype in weight_info."""
-    qtype = weight_info.get("qtype", "fp8")
-    if qtype == "fp8_w8a16":
-        return linear_fp8_w8a16(x, weight_info, out_dtype)
+    # 禁止反量化：FP8 权重永远走 FP8 张量核（_scaled_mm），保持 FP8 域
     return linear_fp8(x, weight_info, out_dtype)
 
 

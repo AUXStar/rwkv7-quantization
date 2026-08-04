@@ -37,7 +37,7 @@ HEAD_LAST_LOGITS_GEMM_MODE = "tuned"
 FFN_DOWN_GEMM_MODE = "tuned"
 ORIG_DENSE_GEMM_MODE = "tuned"
 VRES_GATE_MODE = "tuned"
-FP8_W8A16 = False
+# FP8_W8A16 已删除：禁止任何 FP8 反量化路径（权重永远保持 FP8，走张量核）
 FUSED_GEMM = True
 NO_CUDA_GRAPH = False
 EMB_DEVICE = "cpu"
@@ -702,7 +702,7 @@ class RWKV7:
             if key in self.fp8_keys:
                 # Quantized-domain compute only: FP8 weights stay quantized,
                 # never dequantized back to fp16 at runtime.
-                z[key] = load_fp8_weight(z, key, dev, w8a16=FP8_W8A16)
+                z[key] = load_fp8_weight(z, key, dev)  # W8A8 真量化域，禁止反量化
                 continue
             value = z[key].squeeze()
             is_lowrank = is_lowrank_weight(key)
