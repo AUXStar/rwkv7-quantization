@@ -1,5 +1,15 @@
 # RWKV-7 FP8 Quantized Inference
 
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![PyTorch](https://img.shields.io/badge/PyTorch-%3E%3D2.1-red.svg)](https://pytorch.org/)
+[![Triton](https://img.shields.io/badge/Triton-%3E%3D2.1-green.svg)](https://github.com/openai/triton)
+[![FP8](https://img.shields.io/badge/quantization-FP8%20E4M3-orange.svg)](#quantization-scheme)
+[![Speedup](https://img.shields.io/badge/speedup-6.4x-brightgreen.svg)](#performance-benchmarks)
+[![Accuracy](https://img.shields.io/badge/Top--1-93.75%25-success.svg)](#performance-benchmarks)
+[![VRAM](https://img.shields.io/badge/VRAM-7.35GB-blue.svg)](#performance-benchmarks)
+[![Platform](https://img.shields.io/badge/platform-Blackwell%20%7C%20Ada%20%7C%20Hopper-purple.svg)](#dependencies)
+[![中文](https://img.shields.io/badge/%E6%96%87%E6%A1%A3-中文-red.svg)](README_zh.md)
+
 > **Status**: Production-ready | **Format**: FP8 E4M3 | **Speedup**: 6.4x (7.2B) | **Accuracy loss**: <=0.3%
 
 [中文](README_zh.md) | **English**
@@ -7,6 +17,35 @@
 Full FP8 weight quantization for RWKV-7 models, achieving **44.9 tok/s decode** on RTX 5070 Ti (Blackwell) — 6.4x over the 7.0 tok/s BF16 baseline — while reducing VRAM from 13.3 GB to **7.35 GB** with **93.75%** Top-1 consistency.
 
 MATH500 evaluation reaches **53%** (vs 28% for the original 2.9B model), GSM8K reaches **83%** (vs 27% for 2.9B), demonstrating that FP8 quantization preserves the 7.2B model's reasoning capability nearly losslessly.
+
+### Highlights
+
+- **6.4x decode speedup** — 7.0 to 44.9 tok/s on 7.2B model
+- **45% VRAM reduction** — 13.3 GB to 7.35 GB, fits on consumer GPUs
+- **<0.3% accuracy loss** — 93.75% Top-1 consistency, 53% MATH500, 83% GSM8K
+- **Fused Triton kernels** — Shape-aware tile config for Blackwell FP8 tensor cores
+- **Zero code changes** — Auto-detect quantized weights, drop-in replacement
+- **4-phase systematic research** — 30+ experiments comparing FP8 vs NVFP4 vs residual schemes
+
+### Keywords
+
+`RWKV-7` `RWKV` `FP8` `E4M3` `quantization` `model compression` `inference acceleration` `Triton` `CUDA` `Blackwell` `tensor core` `low-bit quantization` `weight quantization` `LLM` `RNN` `GPU inference` `model optimization` `8-bit quantization` `fused kernel` `RTX 5070 Ti`
+
+---
+
+## Table of Contents
+
+- [Quick Start](#quick-start)
+- [What is RWKV-7?](#what-is-rwkv-7)
+- [Quantization Scheme](#quantization-scheme)
+- [Files](#files)
+- [Performance Benchmarks](#performance-benchmarks)
+- [Iteration History](#iteration-history)
+- [Quantization Sensitivity Analysis](#quantization-sensitivity-analysis)
+- [Technical Notes](#technical-notes)
+- [Dependencies](#dependencies)
+- [Issues](#issues)
+- [Acknowledgments](#acknowledgments)
 
 ---
 
@@ -24,6 +63,17 @@ python rwkv7_fast_v3a.py --model /path/to/rwkv7-7.2b-fp8.pth
 ```
 
 The quantized `.pth` file contains FP8 weights + per-tensor scales + meta rules. The inference engine auto-switches to the quantized path by detecting `.fp8_scale` keys — **no inference code changes required**.
+
+### What is RWKV-7?
+
+RWKV-7 is the latest generation of the RWKV (Receptance Weighted Key Value) architecture — a linear RNN that combines transformer-level performance with RNN-level inference efficiency. Unlike transformers with O(n²) attention, RWKV processes tokens in O(1) per step, making it ideal for long-context generation and edge deployment. This project applies **FP8 E4M3 weight quantization** to reduce model size and accelerate inference on modern NVIDIA GPUs (Blackwell, Ada Lovelace, Hopper).
+
+| Feature | RWKV-7 | Transformer |
+|---------|--------|-------------|
+| Inference complexity | O(1) per token | O(n²) attention |
+| Context length | Unlimited (fixed state) | Bounded by KV cache |
+| VRAM scaling | Constant | Linear with context |
+| Quantization benefit | Direct speedup (memory-bound) | Limited (compute-bound) |
 
 ---
 
@@ -209,6 +259,30 @@ The cost-benefit ratio is extremely low; keeping BF16.
 
 ---
 
+## FAQ
+
+### Does FP8 quantization work on all GPUs?
+
+No. FP8 tensor cores require **NVIDIA Blackwell** (RTX 50 series), **Ada Lovelace** (RTX 40 series), or **Hopper** (H100) architectures. Older GPUs (Ampere and earlier) do not have FP8 hardware support. The `torch._scaled_mm` API and `float8_e4m3fn` dtype require PyTorch >= 2.1.
+
+### How does this compare to GPTQ or AWQ?
+
+GPTQ and AWQ are INT4/INT8 quantization methods that require calibration data. This project uses **FP8 E4M3 per-tensor quantization** — no calibration needed, direct weight-only quantization. FP8 has 256 levels (vs INT4's 16), resulting in much lower quantization error (0.2% vs 8.8% for NVFP4). The trade-off is larger file size (1 byte/weight vs 0.5 bytes for INT4).
+
+### Can I use this with other RWKV models?
+
+Yes. The quantization tool (`quantize_model.py`) works with any RWKV-7 `.pth` model. The 1.5B and 7.2B models were tested. The 13.3B model is planned for future testing.
+
+### Why not use NVFP4 (FP4) for smaller files?
+
+NVFP4 has only 16 discrete values, causing 8.8% relative quantization error — 44x worse than FP8 (0.2%). We tested NVFP4 with FP8 residual compensation (X5 scheme), but it still underperformed pure FP8 on the 7.2B model (91.02% vs 93.75% Top-1). See [Phase 3 reports](iterations/phase3_x5_residual_scheme/) for details.
+
+### Is the quantized model compatible with the original Albatross engine?
+
+Yes. The inference engine auto-detects `.fp8_scale` keys in the model file and routes to the FP8 GEMM path. No code changes needed — just load the quantized `.pth` file as you would the original.
+
+---
+
 ## Dependencies
 
 - PyTorch >= 2.1 (requires `torch._scaled_mm` and `float8_e4m3fn` support)
@@ -233,3 +307,22 @@ Discussions welcome in the [Issues](https://github.com/AUXStar/rwkv7-quantizatio
 - [RWKV-7](https://github.com/RWKV/RWKV-LM) model architecture
 - [Blink_DL](https://modelscope.cn/models/Blink_DL/temp-latest-training-models) model weights
 - [Albatross](https://github.com/BlinkDL/Albatross) inference engine
+
+---
+
+## Citation
+
+If you find this work useful, please cite:
+
+```bibtex
+@misc{rwkv7-fp8-quantization,
+  title={RWKV-7 FP8 Quantized Inference: 6.4x Speedup with Lossless Accuracy},
+  author={AUXStar},
+  year={2026},
+  url={https://github.com/AUXStar/rwkv7-quantization}
+}
+```
+
+## Star History
+
+If this project helps you, please consider giving it a star!
