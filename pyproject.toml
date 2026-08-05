@@ -3,16 +3,16 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "rwkv-quant"
+name = "rwkv-quant-nv"
 version = "1.2.0"
-description = "RWKV-7 Quantization Toolkit - FP8 / INT8 / INT4"
+description = "RWKV-7 Quantization Toolkit - FP8 / INT8 / INT4 (NVIDIA CUDA)"
 readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.10"
 authors = [
     {name = "AUXStar"}
 ]
-keywords = ["rwkv", "quantization", "fp8", "int8", "int4", "inference", "llm"]
+keywords = ["rwkv", "rwkv-7", "quantization", "fp8", "int8", "int4", "nvfp4", "inference", "llm", "cuda"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
