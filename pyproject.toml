@@ -7,7 +7,7 @@ name = "rwkv-quant"
 version = "1.2.0"
 description = "RWKV-7 Quantization Toolkit - FP8 / INT8 / INT4"
 readme = "README.md"
-license = {text = "MIT"}
+license = {file = "LICENSE"}
 requires-python = ">=3.10"
 authors = [
     {name = "AUXStar"}
@@ -42,4 +42,8 @@ Homepage = "https://github.com/AUXStar/rwkv7-quantization"
 Repository = "https://github.com/AUXStar/rwkv7-quantization"
 
 [tool.setuptools]
-packages = ["rwkv_quant"]
+packages = ["rwkv_quant", "cuda"]
+py-modules = ["schemes", "fp8_ops", "fused_fp8_gemm", "rwkv7_fast_v3a"]
+
+[tool.setuptools.package-data]
+cuda = ["*.cpp", "*.cu"]
