@@ -678,6 +678,261 @@ def linear_fp8_m1_fused(x, weight_info, out_dtype=torch.float16):
         out = out.to(out_dtype)
     return out
 
+
+
+# ============================================================================
+# INT8 GEMM: int8 weight × int8 activation → fp16 (no dequantization)
+# ============================================================================
+
+@triton.jit
+def _prep_x_int8_kernel(
+    x_ptr,          # [M, K] fp16/bf16
+    out_ptr,        # [M, K] int8
+    x_scale_ptr,    # [M] fp32 (per-row scale)
+    M, K,
+    stride_xm, stride_xk,
+    stride_om, stride_ok,
+    BLOCK_K: tl.constexpr,
+):
+    """Quantize x to int8 with per-row scale. One row per program."""
+    pid_m = tl.program_id(0)
+    offs_k = tl.arange(0, BLOCK_K)
+    mask = offs_k < K
+
+    x = tl.load(x_ptr + pid_m * stride_xm + offs_k * stride_xk, mask=mask, other=0.0).to(tl.float32)
+    amax = tl.max(tl.abs(x))
+    amax = tl.maximum(amax, 1e-12)
+    scale = 127.0 / amax
+    x_int8 = tl.minimum(tl.maximum(x * scale, -128.0), 127.0).to(tl.int8)
+    tl.store(out_ptr + pid_m * stride_om + offs_k * stride_ok, x_int8, mask=mask)
+    # Store per-row scale
+    tl.store(x_scale_ptr + pid_m, amax / 127.0)
+
+
+def prep_x_int8(x):
+    """Quantize x to int8 with per-row scale. Returns (x_int8 [M,K], x_scale [M] fp32)."""
+    x2 = x.reshape(-1, x.shape[-1])
+    if x2.dtype not in (torch.float16, torch.bfloat16):
+        x2 = x2.to(torch.bfloat16)
+    x2 = x2.contiguous()
+    M, K = x2.shape
+
+    x_int8 = torch.empty(x2.shape, dtype=torch.int8, device=x2.device)
+    x_scale = torch.empty(M, dtype=torch.float32, device=x2.device)
+
+    BLOCK_K = triton.next_power_of_2(K)
+    _prep_x_int8_kernel[(M,)](
+        x2, x_int8, x_scale,
+        M, K,
+        x2.stride(0), x2.stride(1),
+        x_int8.stride(0), x_int8.stride(1),
+        BLOCK_K=BLOCK_K, num_warps=4,
+    )
+    return x_int8, x_scale
+
+
+@triton.jit
+def fused_int8_gemm_kernel(
+    x_ptr,          # [M, K] int8
+    w_ptr,          # [N, K] int8
+    x_scale_ptr,    # [M] fp32 (per-row activation scale)
+    w_scale_ptr,    # scalar fp32 (per-tensor weight scale)
+    out_ptr,        # [M, N] fp16
+    M, N, K,
+    stride_xm, stride_wn, stride_om,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    """INT8 GEMM: x_int8 @ w_int8^T → fp16, with scale compensation.
+
+    acc[m,n] = sum_k(x_int8[m,k] * w_int8[n,k]) * x_scale[m] * w_scale
+    """
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    x_scale = tl.load(x_scale_ptr + offs_m, mask=offs_m < M, other=1.0)  # [BLOCK_M]
+    w_scale = tl.load(w_scale_ptr)  # scalar
+
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.int32)
+
+    for k0 in range(0, K, BLOCK_K):
+        kmask = (k0 + offs_k) < K
+        x_tile = tl.load(x_ptr + offs_m[:, None] * stride_xm + (k0 + offs_k)[None, :],
+                         mask=(offs_m[:, None] < M) & kmask[None, :], other=0)
+        w_tile = tl.load(w_ptr + offs_n[:, None] * stride_wn + (k0 + offs_k)[None, :],
+                         mask=(offs_n[:, None] < N) & kmask[None, :], other=0)
+        # tl.dot(int8, int8) → int32 accumulator (DP4A on NVIDIA)
+        acc = tl.dot(x_tile, tl.trans(w_tile), acc, out_dtype=tl.int32)
+
+    # Apply scales: fp32 multiply
+    acc_f32 = acc.to(tl.float32) * (x_scale[:, None] * w_scale)
+    tl.store(out_ptr + offs_m[:, None] * stride_om + offs_n[None, :],
+             acc_f32.to(tl.float16),
+             mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+def linear_int8_fused(x, weight_info, out_dtype=torch.float16):
+    """INT8 fused GEMM: prep_x_int8 + GEMM (2 launches, no dequantization).
+
+    Weight stays as int8 in VRAM (1 byte/elem vs 2 bytes for fp16).
+    """
+    w = weight_info["weight"]              # [N, K] int8
+    w_scale = weight_info["tensor_scale"]  # scalar fp32
+
+    orig_shape = x.shape
+    x_2d = x.reshape(-1, orig_shape[-1]).contiguous()
+
+    # Quantize activation to int8 (1 launch)
+    x_int8, x_scale = prep_x_int8(x_2d)
+
+    M, K = x_int8.shape
+    N = w.size(0)
+
+    out = torch.empty(M, N, dtype=torch.float16, device=x_int8.device)
+
+    # Tile config (same as FP8)
+    bm, bn, bk, nw = _cfg_for(M, N, K)
+    grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+    fused_int8_gemm_kernel[grid](
+        x_int8, w, x_scale, w_scale, out,
+        M, N, K,
+        x_int8.stride(0), w.stride(0), out.stride(0),
+        BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=8,
+        num_warps=nw,
+    )
+
+    out = out.reshape(*orig_shape[:-1], N)
+    if out_dtype != out.dtype:
+        out = out.to(out_dtype)
+    return out
+
+
+# ============================================================================
+# INT8 RKV fused: 3 GEMMs in 1 kernel (saves 2 launches vs 3 separate)
+# ============================================================================
+
+@triton.jit
+def fused_rkv_int8_kernel(
+    xr_ptr, xk_ptr, xv_ptr,    # [M, K] int8
+    wr_ptr, wk_ptr, wv_ptr,    # [N, K] int8
+    xs_r_ptr, xs_k_ptr, xs_v_ptr,  # [M] fp32 per-row scales
+    wts_ptr,                   # scalar fp32 (shared weight scale, or load 3)
+    or_ptr, ok_ptr, ov_ptr,    # [M, N] fp16
+    M, N, K,
+    stride_xm, stride_wr, stride_wk, stride_wv, stride_om,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    """Fused r/k/v INT8 GEMM: 3 dot products in ONE kernel launch."""
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    xs_r = tl.load(xs_r_ptr + offs_m, mask=offs_m < M, other=1.0)
+    xs_k = tl.load(xs_k_ptr + offs_m, mask=offs_m < M, other=1.0)
+    xs_v = tl.load(xs_v_ptr + offs_m, mask=offs_m < M, other=1.0)
+    wts_r = tl.load(wts_ptr)
+    wts_k = tl.load(wts_ptr + 1) if False else wts_r  # same tensor scale
+    wts_v = wts_r
+
+    acc_r = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.int32)
+    acc_k = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.int32)
+    acc_v = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.int32)
+
+    for k0 in range(0, K, BLOCK_K):
+        kmask = (k0 + offs_k) < K
+        xmask = (offs_m[:, None] < M) & kmask[None, :]
+        wmask = (offs_n[:, None] < N) & kmask[None, :]
+
+        xr = tl.load(xr_ptr + offs_m[:, None] * stride_xm + (k0 + offs_k)[None, :], mask=xmask, other=0)
+        wr = tl.load(wr_ptr + offs_n[:, None] * stride_wr + (k0 + offs_k)[None, :], mask=wmask, other=0)
+        acc_r = tl.dot(xr, tl.trans(wr), acc_r, out_dtype=tl.int32)
+
+        xk = tl.load(xk_ptr + offs_m[:, None] * stride_xm + (k0 + offs_k)[None, :], mask=xmask, other=0)
+        wk = tl.load(wk_ptr + offs_n[:, None] * stride_wk + (k0 + offs_k)[None, :], mask=wmask, other=0)
+        acc_k = tl.dot(xk, tl.trans(wk), acc_k, out_dtype=tl.int32)
+
+        xv = tl.load(xv_ptr + offs_m[:, None] * stride_xm + (k0 + offs_k)[None, :], mask=xmask, other=0)
+        wv = tl.load(wv_ptr + offs_n[:, None] * stride_wv + (k0 + offs_k)[None, :], mask=wmask, other=0)
+        acc_v = tl.dot(xv, tl.trans(wv), acc_v, out_dtype=tl.int32)
+
+    omask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    out_r = (acc_r.to(tl.float32) * (xs_r[:, None] * wts_r)).to(tl.float16)
+    out_k = (acc_k.to(tl.float32) * (xs_k[:, None] * wts_k)).to(tl.float16)
+    out_v = (acc_v.to(tl.float32) * (xs_v[:, None] * wts_v)).to(tl.float16)
+    tl.store(or_ptr + offs_m[:, None] * stride_om + offs_n[None, :], out_r, mask=omask)
+    tl.store(ok_ptr + offs_m[:, None] * stride_om + offs_n[None, :], out_k, mask=omask)
+    tl.store(ov_ptr + offs_m[:, None] * stride_om + offs_n[None, :], out_v, mask=omask)
+
+
+def prep3_x_int8(xr, xk, xv):
+    """Quantize 3 inputs to int8 with per-row scales. Returns 6 tensors."""
+    xr_i8, xs_r = prep_x_int8(xr)
+    xk_i8, xs_k = prep_x_int8(xk)
+    xv_i8, xs_v = prep_x_int8(xv)
+    return xr_i8, xk_i8, xv_i8, xs_r, xs_k, xs_v
+
+
+def linear_rkv_int8_fused(xr, xk, xv, wr_info, wk_info, wv_info, out_dtype=torch.float16):
+    """Fused r/k/v INT8 GEMM: prep3 + single kernel (4 launches → 4, but GEMM is 1 not 3)."""
+    orig_shape = xr.shape
+
+    xr_i8, xk_i8, xv_i8, xs_r, xs_k, xs_v = prep3_x_int8(xr, xk, xv)
+
+    wr = wr_info["weight"]
+    wk = wk_info["weight"]
+    wv = wv_info["weight"]
+    wts = wr_info["tensor_scale"]
+
+    M, K = xr_i8.shape
+    N = wr.size(0)
+
+    or_ = torch.empty(M, N, dtype=torch.float16, device=xr_i8.device)
+    ok_ = torch.empty(M, N, dtype=torch.float16, device=xr_i8.device)
+    ov_ = torch.empty(M, N, dtype=torch.float16, device=xr_i8.device)
+
+    bm, bn, bk, nw = _cfg_for_rkv(M, N, K)
+    grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+    fused_rkv_int8_kernel[grid](
+        xr_i8, xk_i8, xv_i8,
+        wr, wk, wv,
+        xs_r, xs_k, xs_v, wts,
+        or_, ok_, ov_,
+        M, N, K,
+        xr_i8.stride(0),
+        wr.stride(0), wk.stride(0), wv.stride(0), or_.stride(0),
+        BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=8,
+        num_warps=nw,
+    )
+
+    if out_dtype != torch.float16:
+        or_, ok_, ov_ = or_.to(out_dtype), ok_.to(out_dtype), ov_.to(out_dtype)
+    or_ = or_.reshape(*orig_shape[:-1], N)
+    ok_ = ok_.reshape(*orig_shape[:-1], N)
+    ov_ = ov_.reshape(*orig_shape[:-1], N)
+    return or_, ok_, ov_
+
 # ============================================================================
 # Host wrappers
 # ============================================================================
@@ -833,6 +1088,9 @@ def linear_quantized_fused(x, weight_info, out_dtype=torch.float16):
     from fp8_ops import linear_fp8, linear_quantized
     qtype = weight_info.get("qtype", "fp8")
     if qtype == "int8":
+        M = x.numel() // x.size(-1)
+        if M <= FUSED_M_MAX:
+            return linear_int8_fused(x, weight_info, out_dtype)
         return linear_quantized(x, weight_info, out_dtype)
     M = x.numel() // x.size(-1)
     if M <= FUSED_M_MAX:

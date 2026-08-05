@@ -12,8 +12,10 @@ from torch.utils.cpp_extension import load
 from fp8_ops import is_fp8_weight, load_fp8_weight, linear_quantized, linear_quantized_fused, FUSED_M_MAX
 try:
     from fused_fp8_gemm import linear_rkv_fused as _linear_rkv_fused_fp8
+    from fused_fp8_gemm import linear_rkv_int8_fused as _linear_rkv_fused_int8
 except ImportError:
     _linear_rkv_fused_fp8 = None
+    _linear_rkv_fused_int8 = None
 
 HEAD_SIZE = 64
 DTYPE = torch.float16
@@ -974,9 +976,13 @@ class RWKV7:
         wv_info = z.get(p+"value.weight")
         _all_quantized = isinstance(wr_info, dict) and isinstance(wk_info, dict) and isinstance(wv_info, dict)
         _is_fp8 = _all_quantized and wr_info.get("weight") is not None and wr_info.get("qtype", "fp8") == "fp8"
+        _is_int8 = _all_quantized and wr_info.get("weight") is not None and wr_info.get("qtype", "fp8") == "int8"
         if _is_fp8 and _linear_rkv_fused_fp8 is not None and FUSED_GEMM and path.rows <= FUSED_M_MAX:
             # Fused r/k/v FP8 GEMM: prep3_x + fused_rkv_kernel = 2 launches (vs 6)
             r, k, v = _linear_rkv_fused_fp8(xr, xk, xv, wr_info, wk_info, wv_info, out_dtype=DTYPE)
+        elif _is_int8 and _linear_rkv_fused_int8 is not None and FUSED_GEMM and path.rows <= FUSED_M_MAX:
+            # Fused r/k/v INT8 GEMM: prep3 + single kernel (4 launches vs 6)
+            r, k, v = _linear_rkv_fused_int8(xr, xk, xv, wr_info, wk_info, wv_info, out_dtype=DTYPE)
         elif path.use_batched_rkv and not _all_quantized:
             flat = torch.stack((xr.reshape(-1,C), xk.reshape(-1,C), xv.reshape(-1,C)))
             rkv = torch.bmm(flat, z[p+"rkv.weight"])
