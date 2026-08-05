@@ -10,6 +10,10 @@ import torch
 import torch.nn.functional as F
 from torch.utils.cpp_extension import load
 from fp8_ops import is_fp8_weight, load_fp8_weight, linear_quantized, linear_quantized_fused, FUSED_M_MAX
+try:
+    from fused_fp8_gemm import linear_rkv_fused as _linear_rkv_fused_fp8
+except ImportError:
+    _linear_rkv_fused_fp8 = None
 
 HEAD_SIZE = 64
 DTYPE = torch.float16
@@ -965,24 +969,22 @@ class RWKV7:
         else:
             tmix_mix_op = ops.tmix_mix6_3d if use_tmix_mix6_3d(B, T, C) else ops.tmix_mix6
             xr, xw, xk, xv, xa, xg = tmix_mix_op(B, T, C, x.contiguous(), shift_state[0], z[p+"x_r"], z[p+"x_w"], z[p+"x_k"], z[p+"x_v"], z[p+"x_a"], z[p+"x_g"])
-        if pre_mix is not None:
-            if path.use_batched_rkv:
-                flat = torch.stack((xr.reshape(-1,C), xk.reshape(-1,C), xv.reshape(-1,C)))
-                rkv = torch.bmm(flat, z[p+"rkv.weight"])
-                r, k, v = [t.view(B,T,C) for t in rkv.unbind(0)]
-            else:
-                r = self.linear_orig_layout(xr, z[p+"receptance.weight"], path, "att_c2c")
-                k = self.linear_orig_layout(xk, z[p+"key.weight"], path, "att_c2c")
-                v = self.linear_orig_layout(xv, z[p+"value.weight"], path, "att_c2c")
+        wr_info = z.get(p+"receptance.weight")
+        wk_info = z.get(p+"key.weight")
+        wv_info = z.get(p+"value.weight")
+        _all_quantized = isinstance(wr_info, dict) and isinstance(wk_info, dict) and isinstance(wv_info, dict)
+        _is_fp8 = _all_quantized and wr_info.get("weight") is not None and wr_info.get("qtype", "fp8") == "fp8"
+        if _is_fp8 and _linear_rkv_fused_fp8 is not None and FUSED_GEMM and path.rows <= FUSED_M_MAX:
+            # Fused r/k/v FP8 GEMM: prep3_x + fused_rkv_kernel = 2 launches (vs 6)
+            r, k, v = _linear_rkv_fused_fp8(xr, xk, xv, wr_info, wk_info, wv_info, out_dtype=DTYPE)
+        elif path.use_batched_rkv and not _all_quantized:
+            flat = torch.stack((xr.reshape(-1,C), xk.reshape(-1,C), xv.reshape(-1,C)))
+            rkv = torch.bmm(flat, z[p+"rkv.weight"])
+            r, k, v = [t.view(B,T,C) for t in rkv.unbind(0)]
         else:
-            if path.use_batched_rkv:
-                flat = torch.stack((xr.reshape(-1,C), xk.reshape(-1,C), xv.reshape(-1,C)))
-                rkv = torch.bmm(flat, z[p+"rkv.weight"])
-                r, k, v = [t.view(B,T,C) for t in rkv.unbind(0)]
-            else:
-                r = self.linear_orig_layout(xr, z[p+"receptance.weight"], path, "att_c2c")
-                k = self.linear_orig_layout(xk, z[p+"key.weight"], path, "att_c2c")
-                v = self.linear_orig_layout(xv, z[p+"value.weight"], path, "att_c2c")
+            r = self.linear_orig_layout(xr, wr_info, path, "att_c2c")
+            k = self.linear_orig_layout(xk, wk_info, path, "att_c2c")
+            v = self.linear_orig_layout(xv, wv_info, path, "att_c2c")
 
         v1 = None
         if LOWRANK_WEIGHT != "orig" and can_use_lowrank_fused(path.rows) and can_use_lowrank_out_fused(path.rows) and layer != 0:

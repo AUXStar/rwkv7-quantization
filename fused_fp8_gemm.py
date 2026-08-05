@@ -413,6 +413,25 @@ def _cfg_for(M, N=None, K=None):
     return (64, 128, 64, 4)
 
 
+def _cfg_for_rkv(M, N=None, K=None):
+    """Launch config for fused RKV kernel (3 GEMMs in 1 kernel = 3x shared mem).
+
+    Must use smaller tiles than _cfg_for to stay within shared memory limit (101376 bytes).
+    Each FP8 tile uses BLOCK_M*BLOCK_K + BLOCK_N*BLOCK_K bytes of shared mem.
+    For 3 kernels: 3 * (BLOCK_M*BLOCK_K + BLOCK_N*BLOCK_K) <= 101376.
+    """
+    if M <= 4:
+        # att r/k/v: N=C, K=C (1.5B: 2048x2048, 7.2B: 4096x4096)
+        # (16, 64, 64, 4) → 3*(16*64 + 64*64) = 3*5120 = 15360 bytes → OK
+        # (16, 64, 128, 4) → 3*(16*128 + 64*128) = 3*10240 = 30720 → OK
+        if K is not None and K >= 8192:
+            return (16, 64, 128, 4)  # ffn-like large K
+        return (16, 64, 64, 4)
+    if M <= 64:
+        return (16, 64, 64, 4)  # smaller than single GEMM
+    return (32, 64, 64, 4)
+
+
 def _best_method(M, N, K):
     """Choose best GEMM method based on shape (benchmark-tuned).
 
@@ -555,7 +574,7 @@ def _run_rkv_triton(xr, xk, xv, wr, wk, wv, wts_r, wts_k, wts_v, M, N, K):
     or_ = torch.empty(M, N, dtype=torch.float16, device=xr.device)
     ok_ = torch.empty(M, N, dtype=torch.float16, device=xr.device)
     ov_ = torch.empty(M, N, dtype=torch.float16, device=xr.device)
-    bm, bn, bk, nw = _cfg_for(M, N, K)
+    bm, bn, bk, nw = _cfg_for_rkv(M, N, K)
     grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
     fused_rkv_fp8_kernel[grid](
         xr_a, xk_a, xv_a,
@@ -568,6 +587,96 @@ def _run_rkv_triton(xr, xk, xv, wr, wk, wv, wts_r, wts_k, wts_v, M, N, K):
     )
     return or_, ok_, ov_
 
+
+
+
+# ============================================================================
+# Single-launch M=1 kernel: fuse prep_x (amax) + GEMM in ONE launch
+# Each program tile independently computes amax of x[1,K] (cheap for M=1),
+# then quantizes x to FP8 and does tl.dot(fp8, fp8).
+# Saves 1 kernel launch vs prep_x + GEMM (2→1).
+# ============================================================================
+
+@triton.jit
+def fused_fp8_m1_gemm_kernel(
+    x_ptr, w_ptr, w_ts_ptr, out_ptr,
+    N, K, stride_wn, stride_om,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    """M=1 single-launch FP8 GEMM: amax + quantize + dot in ONE kernel.
+
+    Uses software dot product (faster than tl.dot for M=1 since no 16x padding waste).
+    Each N-tile independently computes amax of x[1,K] (cheap for small K).
+    """
+    pid = tl.program_id(0)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    pid_n = pid % num_pid_n
+
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    nmask = offs_n < N
+
+    # Phase 1: compute amax of x[1, K] (each tile does this independently)
+    amax_val = 0.0
+    for k0 in range(0, K, BLOCK_K):
+        kmask = (k0 + offs_k) < K
+        x_tile = tl.load(x_ptr + (k0 + offs_k), mask=kmask, other=0.0).to(tl.float32)
+        amax_val = tl.maximum(amax_val, tl.max(tl.abs(x_tile)))
+    amax_val = tl.maximum(amax_val, 1e-12)
+    inv_xs = 448.0 / amax_val
+
+    # Phase 2: FP8 quantize x and do GEMM (software dot, no tensor core padding waste)
+    acc = tl.zeros([BLOCK_N], dtype=tl.float32)
+    for k0 in range(0, K, BLOCK_K):
+        kmask = (k0 + offs_k) < K
+        x_tile = tl.load(x_ptr + (k0 + offs_k), mask=kmask, other=0.0).to(tl.float32)
+        a_fp8 = tl.minimum(tl.maximum(x_tile * inv_xs, -448.0), 448.0).to(tl.float8e4nv)
+        w_fp8 = tl.load(w_ptr + offs_n[:, None] * stride_wn + (k0 + offs_k)[None, :],
+                        mask=nmask[:, None] & kmask[None, :], other=0.0)
+        # Software dot: sum over K dimension (a_fp8 broadcasts to [BLOCK_N, BLOCK_K])
+        acc += tl.sum(a_fp8.to(tl.float32)[None, :] * w_fp8.to(tl.float32), axis=1)
+
+    w_ts_v = tl.load(w_ts_ptr)
+    acc = acc * (amax_val / 448.0 * w_ts_v)
+    tl.store(out_ptr + offs_n * stride_om, acc.to(tl.float16), mask=nmask)
+
+
+def linear_fp8_m1_fused(x, weight_info, out_dtype=torch.float16):
+    """M=1 FP8 GEMM: single kernel launch (amax + quantize + GEMM fused).
+
+    For M=1 decode, this saves 1 kernel launch vs linear_fp8_fused (2→1).
+    Each N-tile independently computes amax of x[1,K] — cheap since K is small.
+    """
+    if isinstance(weight_info, dict):
+        w = weight_info["weight"]
+        w_ts = weight_info["tensor_scale"]
+    else:
+        w = weight_info
+        w_ts = None
+
+    K = x.size(-1)
+    N = w.size(0)
+
+    x_1d = x.reshape(-1).contiguous()
+    if x_1d.dtype == torch.float16:
+        x_1d = x_1d.to(torch.bfloat16)
+
+    out = torch.empty(N, dtype=torch.float16, device=x_1d.device)
+
+    bm, bn, bk, nw = _cfg_for(1, N, K)
+    grid = (triton.cdiv(N, bn),)
+    fused_fp8_m1_gemm_kernel[grid](
+        x_1d, w, w_ts, out,
+        N, K, w.stride(0), out.stride(0),
+        BLOCK_N=bn, BLOCK_K=bk, GROUP_M=8,
+        num_warps=nw,
+    )
+
+    out = out.reshape(*x.shape[:-1], N)
+    if out_dtype != out.dtype:
+        out = out.to(out_dtype)
+    return out
 
 # ============================================================================
 # Host wrappers
@@ -627,7 +736,7 @@ def linear_rkv_fused(xr, xk, xv, wr_info, wk_info, wv_info, out_dtype=torch.floa
     ok_ = torch.empty(M2, N2, dtype=torch.float16, device=xr_a.device)
     ov_ = torch.empty(M2, N2, dtype=torch.float16, device=xr_a.device)
 
-    bm, bn, bk, nw = _cfg_for(M2, N2, K2)
+    bm, bn, bk, nw = _cfg_for_rkv(M2, N2, K2)
     grid = lambda meta: (triton.cdiv(M2, meta["BLOCK_M"]) * triton.cdiv(N2, meta["BLOCK_N"]),)
     fused_rkv_fp8_kernel[grid](
         xr_a, xk_a, xv_a,
@@ -656,8 +765,8 @@ def linear_rkv_fused(xr, xk, xv, wr_info, wk_info, wv_info, out_dtype=torch.floa
 def linear_fp8_fused(x, weight_info_or_w, res_scale=None, out_dtype=torch.float16):
     """Fused FP8 GEMM (W8A8): prep_x + single-kernel GEMM.
 
-    With CUDA Graph for decode (M<=4): graph replay (0 launch overhead).
-    Hybrid dispatch: Triton+Graph for att, _scaled_mm+Graph for ffn_key.
+    M=1: single-launch kernel (amax+quantize+GEMM fused, 1 launch).
+    M>1: prep_x + GEMM (2 launches).
     """
     if isinstance(weight_info_or_w, dict):
         w = weight_info_or_w["weight"]
@@ -669,6 +778,11 @@ def linear_fp8_fused(x, weight_info_or_w, res_scale=None, out_dtype=torch.float1
     M = x.numel() // x.size(-1)
     K = x.size(-1)
     N = w.size(0)
+
+    # M=1 decode: single-launch fused kernel (1 launch vs 2)
+    if M == 1:
+        return linear_fp8_m1_fused(x, weight_info_or_w if isinstance(weight_info_or_w, dict) else w,
+                                    out_dtype=out_dtype) if isinstance(weight_info_or_w, dict)                else linear_fp8_m1_fused(x, w, out_dtype=out_dtype)
 
     # Try CUDA Graph path for small M
     if USE_CUDA_GRAPH and M <= 4:
@@ -711,20 +825,19 @@ def linear_fp8_fused(x, weight_info_or_w, res_scale=None, out_dtype=torch.float1
 def linear_quantized_fused(x, weight_info, out_dtype=torch.float16):
     """Quantized GEMM dispatcher (used by the engine).
 
-    - INT8: 无硬件张量核，走 linear_quantized（反量化 fp16 GEMM）。
-    - FP8 M <= FUSED_M_MAX: fused single-kernel GEMM (with CUDA Graph).
-    - FP8 M > FUSED_M_MAX: _scaled_mm path (cuBLAS wins for large M).
+    - INT8: 反量化 fp16，走 split-K CUDA kernel (M=1) 或 linear_f16。
+    - FP8 M <= FUSED_M_MAX: Triton 融合内核（2 launches: prep_x + GEMM）。
+      decode (M=1) 用 Triton 融合，比 _scaled_mm（3 launches）少一次 kernel launch。
+    - FP8 M > FUSED_M_MAX: _scaled_mm（cuBLAS，大 M 时 GEMM 效率更高）。
     """
     from fp8_ops import linear_fp8, linear_quantized
     qtype = weight_info.get("qtype", "fp8")
-    # INT8 无融合内核，走通用 dispatcher（内部反量化）
     if qtype == "int8":
         return linear_quantized(x, weight_info, out_dtype)
     M = x.numel() // x.size(-1)
     if M <= FUSED_M_MAX:
         return linear_fp8_fused(x, weight_info, out_dtype)
-    # Large M: _scaled_mm（FP8 张量核，保持 FP8 域，禁止反量化）
     return linear_fp8(x, weight_info, out_dtype)
 
 
-FUSED_M_MAX = 64  # use fused single-kernel GEMM when M <= this (decode/small-batch domain)
+FUSED_M_MAX = 512  # decode+prefill: Triton fused (2 launches) beats _scaled_mm (3 launches)
