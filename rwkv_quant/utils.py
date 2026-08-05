@@ -50,8 +50,7 @@ def hs(num: float) -> str:
 _VOCAB_CANDIDATES = (
     "rwkv_vocab_v20230424.txt",                       # 项目内
     "~/.local/lib/python3.13/site-packages/rwkv/rwkv_vocab_v20230424.txt",
-    "~/RWKV-Server/.venv/lib/python3.13/site-packages/rwkv/rwkv_vocab_v20230424.txt",
-    "~/test/.venv/lib/python3.13/site-packages/rwkv/rwkv_vocab_v20230424.txt",
+    os.path.expanduser("~/.venv/lib/python3.13/site-packages/rwkv/rwkv_vocab_v20230424.txt"),
 )
 
 

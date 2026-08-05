@@ -19,7 +19,7 @@ except ImportError:
 
 HEAD_SIZE = 64
 DTYPE = torch.float16
-MODEL_PATH = "/dev/shm/rwkv7-g1f-7.2b-20260414-ctx8192.pth"
+MODEL_PATH = ""  # set via --model arg or rwkv_quant.engine
 THIS_DIR = Path(__file__).resolve().parent
 CUDA_DIR = THIS_DIR / "cuda"
 L,C,H,N,V = 0,0,0,HEAD_SIZE,0
