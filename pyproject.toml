@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "rwkv-quant-nv"
-version = "1.2.0"
+version = "1.2.1"
 description = "RWKV-7 Quantization Toolkit - FP8 / INT8 / INT4 (NVIDIA CUDA)"
 readme = "README.md"
 license = {file = "LICENSE"}
@@ -42,7 +42,7 @@ Homepage = "https://github.com/AUXStar/rwkv7-quantization"
 Repository = "https://github.com/AUXStar/rwkv7-quantization"
 
 [tool.setuptools]
-packages = ["rwkv_quant", "cuda"]
+packages = ["rwkv_quant", "cuda", "int4", "int8"]
 py-modules = ["schemes", "fp8_ops", "fused_fp8_gemm", "rwkv7_fast_v3a"]
 
 [tool.setuptools.package-data]
